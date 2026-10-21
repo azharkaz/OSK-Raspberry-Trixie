@@ -11,6 +11,8 @@
   osk build                    пересобрать wvkbd-wide (mkwide.py из wide.toml, патчи, make)
   osk layout en|ru|toggle      сменить раскладку СИСТЕМЫ (физическая клавиатура); слой экранной
                                клавиатуры подстроится сам. Так делает и кнопка EN/RU на экране
+  osk autostart on|off|status  автозапуск при входе в систему (labwc): клавиатура свёрнута + значок раскладки
+  osk start --hidden           запустить клавиатуру свёрнутой (независимо от start_hidden в конфиге)
   osk slot                     для xfce4-panel (плагин «Генератор монитора»): пустое место под значок раскладки
   osk layer en|ru              выбрать слой экранной клавиатуры (нужен wvkbd, собранный с патчем layout-sync)
 
@@ -299,13 +301,48 @@ def build(kb):
     print("osk build: готово, примени командой `osk restart`")
 
 
+AUTOSTART = HOME / ".config/labwc/autostart"
+A_BEGIN, A_END = "# >>> osk-autostart (управляется командой `osk autostart`, руками не править)", "# <<< osk-autostart"
+A_BLOCK = f"""{A_BEGIN}
+( sleep 4; "$HOME/.local/bin/osk" start --hidden; "$HOME/.local/bin/osk-tray" start ) >/dev/null 2>&1 &
+{A_END}
+"""
+
+
+def cmd_autostart(arg):
+    txt = AUTOSTART.read_text() if AUTOSTART.exists() else ""
+    has = A_BEGIN in txt
+    if arg == "status":
+        print("автозапуск: ВКЛЮЧЁН" if has else "автозапуск: выключен", f"({AUTOSTART})")
+        other = [l for l in txt.splitlines() if ("osk-tray" in l or "/osk " in l) and not l.startswith("#") and A_BEGIN not in l]
+        if other and not has:
+            print("в файле уже есть свои строки запуска:", *other, sep="\n  ")
+        return
+    if arg not in ("on", "off"):
+        sys.exit("osk autostart on|off|status")
+    if has:                                                   # убираем прежний блок (для on - чтобы записать заново)
+        head, _, rest = txt.partition(A_BEGIN)
+        _, _, tail = rest.partition(A_END)
+        txt = head.rstrip("\n") + ("\n" if head.strip() else "") + tail.lstrip("\n")
+    if arg == "on":
+        if AUTOSTART.exists() and not (AUTOSTART.parent / "autostart.bak-osk").exists():
+            shutil.copy(AUTOSTART, AUTOSTART.parent / "autostart.bak-osk")       # копия на всякий случай (один раз)
+        AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+        txt = (txt.rstrip("\n") + "\n" if txt.strip() else "") + A_BLOCK
+    AUTOSTART.write_text(txt)
+    print("автозапуск включён: после входа в систему клавиатура запустится свёрнутой, значок появится сам"
+          if arg == "on" else "автозапуск выключен")
+
+
 def main():
     a = sys.argv[1:]
     cmd = a[0] if a else "toggle"
+    if cmd == "autostart":
+        return cmd_autostart(a[1] if len(a) > 1 else "status")
     kb, colors = load()
     st = get_state(kb)
     if cmd in ("start", "restart"):
-        start(kb, colors)
+        start(kb, colors, hidden=True if "--hidden" in a else None)
     elif cmd == "stop":
         stop(kb)
     elif cmd == "show":

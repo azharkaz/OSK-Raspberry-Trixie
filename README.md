@@ -14,4 +14,5 @@
 
 Установка: скопировать `osk osk-tray clipd` в `~/.local/bin/`, `osk.toml` в `~/.config/osk/`, `ICONs` рядом с `osk-tray`
 на Pi командой `osk build`.
+Автозапуск: `osk autostart on` (клавиатура свёрнута + значок), выключить: `osk autostart off`.
 Значок плавающий: перетащите его левой кнопкой, позиция запоминается. `osk-tray hide|show|toggle` - управление клавиатурой из терминала.
