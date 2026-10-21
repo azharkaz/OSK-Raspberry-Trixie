@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""clipd - мультибуфер обмена для Wayland (labwc) с историей и синхронизацией
+через Syncthing в формате ContextMenu-TVBox (папка claude_bufer).
+
+  clipd watch              демон: следит за буфером (запускать из autostart)
+  clipd pick [--paste] [--toggle]  окно истории (--toggle: повторный вызов закрывает окно); меню: входящие, последние клипы и история всех устройств
+  clipd send [УСТРОЙСТВО]  отправить текущий буфер в to_<УСТРОЙСТВО>.txt (all - всем)
+  clipd store [--primary]  служебное: принять содержимое буфера со stdin
+
+Конфиг: секция [clipboard] в ~/.config/osk/osk.toml (или ~/.config/clipd/config.toml)
+"""
+import fcntl
+import fnmatch
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONF = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "clipd" / "config.toml"
+OSK_CONF = Path(os.environ.get("OSK_CONFIG", HOME / ".config/osk/osk.toml"))   # общий конфиг, секция [clipboard]
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+DEFAULTS = {
+    "device": "raspi",                                   # имя этого устройства в файлах
+    "sync_dir": str(HOME / "Syncthing/Zametki_ALL/claude_bufer"),
+    "max_entries": 500,                                  # сколько записей хранить в clip_hist-<device>.txt
+    "max_bytes": 100000,                                 # клипы больше этого размера не сохраняем
+    "primary": False,                                    # писать ли выделение мышью (PRIMARY)
+    "menu": "fuzzel",                                    # fuzzel | wofi
+    "close_item": "top",                                 # пункт «Закрыть» в меню: top | bottom | off
+    "menu_limit": 300,                                   # сколько пунктов показывать в меню
+    "paste_delay_ms": 350,                               # пауза перед вставкой после закрытия окна
+    "paste_mods": ["ctrl"],                              # для терминала: ["ctrl", "shift"]
+    "ui": "gtk",                                         # gtk - окно с вкладками | fuzzel - простой список
+    "include": ["*.txt"],                                # какие файлы из sync_dir показывать вкладками
+    "exclude": [],                                       # какие скрыть (маски), например ["to_redmi.txt"]
+    "tab_order": [],                                     # порядок вкладок: имена файлов, остальные после
+    "tab_labels": {},                                    # свои названия вкладок: {"clip_hist-raspi.txt" = "История Pi"}
+    "show_empty_tabs": False,
+    "rows_per_tab": 200,
+    "row_lines": 4,                  # сколько строк многострочной записи показывать в списке
+    "refresh_ms": 1000,              # как часто окно истории проверяет, не появились ли новые записи
+    "window_width": 700,
+    "window_height": 540,
+    "close_on_focus_out": True,                          # закрывать окно при клике мимо
+}
+
+CLOSE = "\u2715 Закрыть"
+SPLIT = re.compile(r"(?:^|\n)===ENTRY (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)===\n")
+
+
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    for path, section in ((CONF, None), (OSK_CONF, "clipboard")):    # второй файл главнее
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except FileNotFoundError:
+            continue
+        cfg.update(data.get(section, {}) if section else data)
+    cfg["sync_dir"] = os.path.expanduser(cfg["sync_dir"])
+    return cfg
+
+
+def read_text(p):
+    try:
+        with open(p, encoding="utf-8", errors="replace", newline="") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def atomic_write(path, data):
+    # имя .syncthing.*.tmp Syncthing игнорирует, так что наружу временный файл не уйдёт
+    tmp = path.with_name(f".syncthing.{path.name}.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def entry(text, ts=None):
+    ts = ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return f"\n===ENTRY {ts}===\n{text}\n"
+
+
+def parse_history(p):
+    parts = SPLIT.split(read_text(p))
+    return [(parts[i], parts[i + 1].removesuffix("\n")) for i in range(1, len(parts) - 1, 2)]
+
+
+def trim(hist, keep):
+    items = parse_history(hist)
+    if len(items) <= keep + keep // 5:
+        return
+    atomic_write(hist, "".join(entry(t, ts) for ts, t in items[-keep:]))
+
+
+def lock(name, block=True):
+    f = open(RUN / f"clipd-{name}.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+    except OSError:
+        return None
+    return f
+
+
+LOGF = HOME / ".cache/clipd/clipd.log"
+
+
+def log(msg):
+    try:
+        LOGF.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOGF, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def notify(msg):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "clipd", "-t", "2000", "clipd", msg])
+
+
+def known_devices(cfg):
+    names = set()
+    for p in Path(cfg["sync_dir"]).glob("*.txt"):
+        n = p.stem
+        if n.startswith("clip_hist-"):
+            names.add(n[len("clip_hist-"):])
+        elif n.startswith("to_"):
+            names.add(n[len("to_"):])
+        elif not n.startswith("history_all_"):
+            names.add(n)
+    names.discard(cfg["device"])
+    names.discard("all")
+    return sorted(names)
+
+
+# ---------- store ----------
+
+def cmd_store(cfg, primary=False):
+    data = sys.stdin.buffer.read()
+    if not data or len(data) > cfg["max_bytes"]:
+        return
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return
+    text = text.replace("\x00", "")          # нулевые байты (например, из файлового менеджера) портят файл истории
+    if not text.strip():
+        return
+    types = subprocess.run(
+        ["wl-paste", "--list-types"] + (["--primary"] if primary else []),
+        capture_output=True, text=True).stdout
+    if "passwordManagerHint" in types:      # менеджеры паролей помечают свои клипы
+        return
+    d = Path(cfg["sync_dir"])
+    if not d.is_dir():
+        return
+    me = cfg["device"]
+    lk = lock("store")                      # noqa: F841 (держим блокировку до конца)
+    latest = d / f"{me}.txt"
+    if read_text(latest) == text:
+        return
+    atomic_write(latest, text)
+    hist = d / f"clip_hist-{me}.txt"
+    with open(hist, "a", encoding="utf-8", newline="") as f:
+        f.write(entry(text))
+    trim(hist, cfg["max_entries"])
+
+
+# ---------- watch ----------
+
+def cmd_watch(cfg):
+    lk = lock("watch", block=False)
+    if lk is None:
+        sys.exit("clipd уже запущен")
+    me = os.path.realpath(__file__)
+    cmds = [["wl-paste", "--type", "text", "--watch", sys.executable, me, "store"]]
+    if cfg["primary"]:
+        cmds.append(["wl-paste", "--primary", "--type", "text", "--watch",
+                     sys.executable, me, "store", "--primary"])
+    procs = []
+
+    def stop(*_):
+        for p in procs:
+            p.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        procs[:] = [subprocess.Popen(c) for c in cmds]
+        while all(p.poll() is None for p in procs):
+            time.sleep(1)
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+            p.wait()
+        time.sleep(3)                       # перезапуск, если wl-paste упал
+
+
+# ---------- menu / pick ----------
+
+def menu(cfg, lines, prompt):
+    if cfg["menu"] == "wofi":
+        cmd = ["wofi", "--dmenu", "-p", prompt]
+    else:
+        cmd = ["fuzzel", "--dmenu", "--prompt", prompt + " ", "--width", "90"]
+    pos = cfg["close_item"]
+    if pos == "top":
+        lines = [CLOSE] + lines
+    elif pos == "bottom":
+        lines = lines + [CLOSE]
+    r = subprocess.run(cmd, input="\n".join(lines) + "\n", text=True, capture_output=True)
+    out = r.stdout.rstrip("\n") if r.returncode == 0 else None
+    return None if out == CLOSE else out
+
+
+def flat(t, n=110):
+    s = re.sub(r"\s*\n\s*", " \u21b5 ", t.strip())
+    s = re.sub(r"[ \t]+", " ", s)
+    return s if len(s) <= n else s[:n - 1] + "\u2026"
+
+
+def collect(cfg):
+    d, me = Path(cfg["sync_dir"]), cfg["device"]
+    items = []
+    for name, label in ((f"to_{me}.txt", "\u21e9 мне"), ("to_all.txt", "\u21e9 всем")):
+        t = read_text(d / name)
+        if t.strip():
+            items.append((label, t))
+    for dev in known_devices(cfg):
+        t = read_text(d / f"{dev}.txt")
+        if t.strip():
+            items.append((f"\u25cf {dev}", t))
+    hist, seen, n = [], set(), 0
+    for p in sorted(d.glob("clip_hist-*.txt")):
+        dev = p.stem[len("clip_hist-"):]
+        for ts, t in parse_history(p):
+            n += 1                          # n удерживает порядок записей внутри файла
+            if t.strip():
+                hist.append((ts, n, dev, t))
+    for ts, _, dev, t in sorted(hist, reverse=True):
+        if (dev, t) in seen:
+            continue
+        seen.add((dev, t))
+        items.append((f"{dev} {ts[5:16].replace('T', ' ')}", t))
+    return items[:cfg["menu_limit"]]
+
+
+def refocus_tray():
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.sendto(b"refocus", str(RUN / "osk-tray.sock"))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def deliver(cfg, text, paste):
+    """Положить текст в буфер и (если нужно) вставить в активное окно."""
+    log(f"deliver: {len(text)} символов, paste={paste}")
+    subprocess.run(["wl-copy"], input=text.encode("utf-8"))
+    if not paste:
+        return
+    wtype = shutil.which("wtype")
+    if not wtype:
+        log("wtype не найден")
+        notify("Для вставки нужен wtype: sudo apt install wtype (текст уже в буфере)")
+        return
+    ok = refocus_tray()
+    if ok:
+        log("refocus: команда значку отправлена")                       # слой overlay мог забрать фокус: просим значок вернуть его прежнему окну
+    log(f"refocus: {'отправлено' if ok else 'значок не запущен'}")
+    time.sleep(cfg["paste_delay_ms"] / 1000)
+    mods = cfg["paste_mods"]
+    args = ([wtype] + [x for m in mods for x in ("-M", m)] + ["-k", "v"]
+            + [x for m in reversed(mods) for x in ("-m", m)])
+    r = subprocess.run(args, capture_output=True, text=True)
+    log(f"wtype rc={r.returncode} {r.stderr.strip()}")
+    if r.returncode:
+        notify("wtype не смог вставить, см. ~/.cache/clipd/clipd.log")
+
+
+def cmd_testpaste(cfg):
+    """clipd testpaste - проверка вставки: за 6 секунд кликните в поле ввода, туда придёт слово TEST-VSTAVKA."""
+    print("wtype:   ", shutil.which("wtype") or "НЕ НАЙДЕН (sudo apt install wtype)")
+    print("wl-copy: ", shutil.which("wl-copy") or "НЕ НАЙДЕН (sudo apt install wl-clipboard)")
+    sock = RUN / "osk-tray.sock"
+    print("значок:  ", "запущен" if sock.exists() else "не запущен (фокус возвращать некому)")
+    print("paste_mods:", cfg["paste_mods"], "| paste_delay_ms:", cfg["paste_delay_ms"])
+    print("Через 6 секунд вставлю TEST-VSTAVKA. Кликните сейчас в поле ввода (например, в mousepad)...")
+    time.sleep(6)
+    deliver(cfg, "TEST-VSTAVKA", True)
+    print("Готово. Последние строки журнала:")
+    try:
+        print("".join(LOGF.read_text(encoding="utf-8").splitlines(True)[-6:]))
+    except OSError:
+        pass
+
+
+def cmd_pick_menu(cfg, paste):
+    """Простое меню fuzzel (запасной вариант)."""
+    items = collect(cfg)
+    if not items:
+        notify("Буфер пуст")
+        return
+    lines = [f"{i:04d}  {lab}  {flat(t)}" for i, (lab, t) in enumerate(items)]
+    sel = menu(cfg, lines, "Буфер")
+    if not sel:
+        return
+    m = re.match(r"\s*(\d{4})\s", sel)
+    if not m or int(m.group(1)) >= len(items):
+        return
+    deliver(cfg, items[int(m.group(1))][1], paste)
+
+
+# ---------- окно с вкладками (GTK) ----------
+
+def tab_label(cfg, name):
+    custom = cfg["tab_labels"].get(name)
+    if custom:
+        return str(custom)
+    stem = name[:-4] if name.endswith(".txt") else name
+    if stem.startswith("clip_hist-"):
+        return f"История {stem[len('clip_hist-'):]}"
+    if stem == "to_all":
+        return "\u2192 всем"
+    if stem.startswith("to_"):
+        return f"\u2192 {stem[3:]}"
+    return f"\u25cf {stem}"                 # последний клип устройства
+
+
+def file_entries(p):
+    """-> [(метка времени или "", текст)], новые первыми."""
+    raw = read_text(p)
+    parts = SPLIT.split(raw)
+    if len(parts) >= 3:                      # файл истории
+        ents = [(parts[i], parts[i + 1].removesuffix("\n")) for i in range(1, len(parts) - 1, 2)]
+        return [(ts, t) for ts, t in reversed(ents) if t.strip()]
+    return [("", raw)] if raw.strip() else []
+
+
+def tab_sort_key(cfg, name):
+    order = cfg["tab_order"]
+    if name in order:
+        return (0, order.index(name), "", name)
+    stem = name[:-4] if name.endswith(".txt") else name
+    me = cfg["device"]
+    hist = stem.startswith("clip_hist-")
+    dev = stem[len("clip_hist-"):] if hist else (stem[3:] if stem.startswith("to_") else stem)
+    if dev == me and not stem.startswith("to_"):
+        rank = 1                              # свои файлы
+    elif stem in (f"to_{me}", "to_all"):
+        rank = 2                              # входящие
+    elif stem.startswith("to_"):
+        rank = 4                              # адресованное другим
+    else:
+        rank = 3                              # чужие устройства
+    return (1, rank, dev, (1 if hist else 0, name))
+
+
+def collect_tabs(cfg):
+    d = Path(cfg["sync_dir"])
+    tabs = []
+    for p in d.glob("*"):
+        n = p.name
+        if not p.is_file() or n.startswith("."):
+            continue
+        if not any(fnmatch.fnmatch(n, g) for g in cfg["include"]):
+            continue
+        if any(fnmatch.fnmatch(n, g) for g in cfg["exclude"]):
+            continue
+        ents = file_entries(p)
+        if ents or cfg["show_empty_tabs"]:
+            tabs.append({"name": n, "label": tab_label(cfg, n), "entries": ents})
+    tabs.sort(key=lambda t: tab_sort_key(cfg, t["name"]))
+    return tabs
+
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk"
+WIN_STATE = STATE_DIR / "clip-win.json"        # размер и положение окна истории
+TRAY_STATE = STATE_DIR / "tray-pos.json"       # сюда значок пишет высоту панели
+PICK_PID = RUN / "clipd-pick.pid"
+
+
+def short_text(text, lines=4, width=180):
+    """Первые несколько строк записи для списка (длинные строки режем, остаток помечаем)."""
+    ls = text.strip().splitlines() or [""]
+    out = [l if len(l) <= width else l[:width] + "\u2026" for l in ls[:lines]]
+    if len(ls) > lines:
+        out[-1] += f"   \u2026 (ещё строк: {len(ls) - lines})"
+    return "\n".join(out)
+
+
+def mutate_entry(cfg, name, ts, old, new):
+    """Изменить (new - текст) или удалить (new=None) запись файла. История: запись ищется по метке и тексту;
+    одиночный файл (to_*.txt, последний клип): текст заменяется или файл очищается. -> True, если сделано."""
+    p = Path(cfg["sync_dir"]) / name
+    lk = lock("store")                                    # noqa: F841 (не пересекаться с записью новых клипов)
+    raw = read_text(p)
+    if len(SPLIT.split(raw)) >= 3:
+        items = parse_history(p)
+        for i, (t0, x) in enumerate(items):
+            if t0 == ts and x == old:
+                if new is None:
+                    del items[i]
+                else:
+                    items[i] = (t0, new)
+                atomic_write(p, "".join(entry(tx, tt) for tt, tx in items))
+                log(f"запись {'удалена' if new is None else 'изменена'}: {name} {ts}")
+                return True
+        return False
+    atomic_write(p, "" if new is None else new)
+    log(f"файл {'очищен' if new is None else 'изменён'}: {name}")
+    return True
+
+
+def osk_reserved():
+    """Сколько px занимает показанная экранная клавиатура (0, если скрыта или не запущена)."""
+    try:
+        pid = int((RUN / "osk.pid").read_text())
+        if b"wvkbd" not in Path(f"/proc/{pid}/cmdline").read_bytes():
+            return 0
+        if (RUN / "osk.state").read_text().strip() != "shown":
+            return 0
+        with open(OSK_CONF, "rb") as f:
+            k = tomllib.load(f).get("keyboard", {})
+        return int(k.get("landscape_height", k.get("height", 300)))
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return 0
+
+
+def panel_height():
+    try:
+        return int(json.loads(TRAY_STATE.read_text()).get("panel_h", 40))
+    except (OSError, ValueError, TypeError):
+        return 40
+
+
+def load_geo():
+    try:
+        d = json.loads(WIN_STATE.read_text())
+        return {k: int(d[k]) for k in ("x", "y", "w", "h")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_geo(geo):
+    try:
+        WIN_STATE.parent.mkdir(parents=True, exist_ok=True)
+        WIN_STATE.write_text(json.dumps(geo))
+    except OSError:
+        pass
+
+
+def import_layer_shell():
+    """gtk-layer-shell нужно загрузить раньше GTK (порядок библиотек). None, если недоступен."""
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return None
+    try:
+        import gi
+        gi.require_version("GtkLayerShell", "0.1")
+        from gi.repository import GtkLayerShell as L
+    except (ValueError, ImportError):
+        log("нет gtk-layer-shell (sudo apt install gir1.2-gtklayershell-0.1): окно может прятаться под клавиатурой")
+        return None
+    return L
+
+
+def build_window(cfg, tabs, choose, L=None):
+    """Собрать окно; choose(text, paste) вызывается при выборе записи.
+    Возвращает (win, nb, lists, search, state). Поверх экранной клавиатуры (слой overlay) окно рисуется
+    без рамки, поэтому заголовок для перетаскивания, крестик и уголок для изменения размера - свои."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango
+
+    win = Gtk.Window(title="Буфер обмена")
+    layer = bool(L) and L.is_supported()
+    disp = Gdk.Display.get_default()
+    try:
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        SW, SH = mon.get_geometry().width, mon.get_geometry().height
+    except Exception:
+        SW, SH = 1920, 1080
+    geo = None
+    if layer:
+        reserved = osk_reserved() + (panel_height() if osk_reserved() else 0)
+        saved = load_geo()
+        w = max(360, min(saved["w"] if saved else cfg["window_width"], SW))
+        h = max(240, min(saved["h"] if saved else cfg["window_height"], SH - 20))
+        if saved:
+            x, y = saved["x"], saved["y"]
+        else:                                           # по центру, выше клавиатуры
+            x = (SW - w) // 2
+            y = max(10, SH - reserved - h - 20) if reserved else max(10, (SH - h) // 2)
+        geo = {"x": max(0, min(x, SW - w)), "y": max(0, min(y, SH - 60)), "w": w, "h": h}
+        L.init_for_window(win)
+        L.set_namespace(win, "osk-clip")
+        L.set_layer(win, L.Layer.OVERLAY)
+        if hasattr(L, "set_keyboard_mode"):
+            L.set_keyboard_mode(win, L.KeyboardMode.ON_DEMAND)
+        else:
+            L.set_keyboard_interactivity(win, True)
+        L.set_exclusive_zone(win, -1)
+        L.set_anchor(win, L.Edge.TOP, True)
+        L.set_anchor(win, L.Edge.LEFT, True)
+        L.set_margin(win, L.Edge.TOP, geo["y"])
+        L.set_margin(win, L.Edge.LEFT, geo["x"])
+        win.set_default_size(geo["w"], geo["h"])
+        win.set_size_request(geo["w"], geo["h"])
+        win.set_decorated(False)
+        css = Gtk.CssProvider()
+        css.load_from_data(b""".osk-clip { border: 1px solid #777; border-radius: 8px; }
+                              .osk-head { font-weight: bold; padding: 4px 6px; }
+                              .osk-grip { padding: 2px 6px; color: #888; }""")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    else:
+        win.set_default_size(cfg["window_width"], cfg["window_height"])
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_keep_above(True)
+        win.set_position(Gtk.WindowPosition.MOUSE)     # на Wayland игнорируется
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    box.get_style_context().add_class("osk-clip")
+    for side in ("top", "bottom", "start", "end"):
+        getattr(box, f"set_margin_{side}")(6)
+    win.add(box)
+
+    state = {"q": "", "paste": True}
+    lists = []
+
+    def row_matches(row, *_):
+        return not state["q"] or state["q"] in row.osk_text.lower()
+
+    # ---- заголовок: перетаскивание и крестик ----
+    if layer:
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        handle = Gtk.EventBox()
+        handle.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                          Gdk.EventMask.POINTER_MOTION_MASK)
+        title = Gtk.Label(label="☰  Буфер обмена  (потяните, чтобы переместить)")
+        title.set_xalign(0)
+        title.get_style_context().add_class("osk-head")
+        handle.add(title)
+        head.pack_start(handle, True, True, 0)
+        close = Gtk.Button(label="✕")
+        close.set_focus_on_click(False)
+        close.connect("clicked", lambda *_: win.close())
+        head.pack_start(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+        drag = {"on": False, "x": 0, "y": 0}
+
+        def apply_pos():
+            L.set_margin(win, L.Edge.TOP, geo["y"])
+            L.set_margin(win, L.Edge.LEFT, geo["x"])
+            win.queue_resize()
+
+        def h_press(_w, ev):
+            if ev.button == 1:
+                drag.update(on=True, x=ev.x, y=ev.y)
+            return True
+
+        def h_motion(_w, ev):
+            if drag["on"]:
+                geo["x"] = max(0, min(geo["x"] + int(ev.x - drag["x"]), SW - 80))
+                geo["y"] = max(0, min(geo["y"] + int(ev.y - drag["y"]), SH - 40))
+                apply_pos()
+            return True
+
+        def h_release(_w, ev):
+            drag["on"] = False
+            save_geo(geo)
+            return True
+
+        handle.connect("button-press-event", h_press)
+        handle.connect("motion-notify-event", h_motion)
+        handle.connect("button-release-event", h_release)
+
+    stack = Gtk.Stack()
+    lst = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    stack.add_named(lst, "list")
+    box.pack_start(stack, True, True, 0)
+    search = Gtk.SearchEntry()
+    search.set_placeholder_text("Поиск по всем записям вкладки...")
+    lst.pack_start(search, False, False, 0)
+    nb = Gtk.Notebook()
+    nb.set_scrollable(True)
+    lst.pack_start(nb, True, True, 0)
+
+    def selected_row():
+        lb = lists[nb.get_current_page()]
+        return lb.get_selected_row()
+
+    def selected_text():
+        row = selected_row()
+        return row.osk_text if row else None
+
+    mt = {}
+
+    def mtime(name):
+        try:
+            return os.stat(Path(cfg["sync_dir"]) / name).st_mtime_ns
+        except OSError:
+            return None
+
+    def make_row(ts, text, name):
+        row = Gtk.ListBoxRow()
+        row.osk_text, row.osk_ts, row.osk_file = text, ts, name
+        row.set_tooltip_text(text[:1000])
+        rbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(rbox, f"set_margin_{side}")(5)
+        if ts:
+            tl = Gtk.Label()
+            tl.set_markup('<span size="small" alpha="60%">' +
+                          GLib.markup_escape_text(ts.replace("T", " ")) + "</span>")
+            tl.set_xalign(0)
+            rbox.pack_start(tl, False, False, 0)
+        lab = Gtk.Label(label=short_text(text, int(cfg["row_lines"])))
+        lab.set_xalign(0)
+        lab.set_line_wrap(True)
+        lab.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        rbox.pack_start(lab, False, False, 0)
+        row.add(rbox)
+        return row
+
+    def fill(i, entries, name):
+        lb = lists[i]
+        keep = None
+        cur = lb.get_selected_row()
+        if cur is not None:
+            keep = (cur.osk_ts, cur.osk_text)
+        for ch in lb.get_children():
+            lb.remove(ch)
+        sel = None
+        for ts, text in entries[:cfg["rows_per_tab"]]:
+            row = make_row(ts, text, name)
+            lb.add(row)
+            if keep == (ts, text):
+                sel = row
+        lb.show_all()
+        if sel is not None:
+            lb.select_row(sel)
+        mt[name] = mtime(name)
+
+    def refresh():
+        """Окно открыто, а клипы продолжают приходить: перечитываем изменившиеся файлы."""
+        if stack.get_visible_child_name() != "list":
+            return True
+        for i, tab in enumerate(tabs):
+            if mtime(tab["name"]) != mt.get(tab["name"]):
+                fill(i, file_entries(Path(cfg["sync_dir"]) / tab["name"]), tab["name"])
+        return True
+
+    def force_refresh(name):
+        mt.pop(name, None)
+        refresh()
+
+    # ---- контекстное меню, правка и удаление ----
+    menu_state = {"del_row": None, "del_id": 0}
+    edit = {"row": None}
+    etv = Gtk.TextView()
+    etv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+    ebuf = etv.get_buffer()
+
+    def do_choose(paste_it):
+        t = selected_text()
+        if t is None:
+            notify("Сначала выберите запись (клик по ней)")
+        else:
+            choose(t, paste_it)
+
+    def start_edit(*_):
+        row = selected_row()
+        if row is None:
+            notify("Сначала выберите запись (клик по ней)")
+            return
+        edit["row"] = row
+        ebuf.set_text(row.osk_text)
+        stack.set_visible_child_name("edit")
+        etv.grab_focus()
+
+    def cancel_edit(*_):
+        edit["row"] = None
+        stack.set_visible_child_name("list")
+        search.grab_focus()
+
+    def save_edit(*_):
+        row = edit["row"]
+        new = ebuf.get_text(ebuf.get_start_iter(), ebuf.get_end_iter(), True)
+        if row is None:
+            return cancel_edit()
+        if not new.strip():
+            notify("Пустой текст не сохраняю. Чтобы убрать запись, нажмите «Удалить»")
+            return
+        if not mutate_entry(cfg, row.osk_file, row.osk_ts, row.osk_text, new):
+            notify("Запись не найдена: файл изменился. Список обновлён")
+        name = row.osk_file
+        cancel_edit()
+        force_refresh(name)
+
+    def delete_sel(*_):
+        row = selected_row()
+        if row is None:
+            notify("Сначала выберите запись (клик по ней)")
+            return
+        if menu_state["del_row"] is row:                    # второе нажатие: подтверждение
+            menu_state["del_row"] = None
+            b_del.set_label("Удалить")
+            if not mutate_entry(cfg, row.osk_file, row.osk_ts, row.osk_text, None):
+                notify("Запись не найдена: файл изменился. Список обновлён")
+            force_refresh(row.osk_file)
+            return
+        menu_state["del_row"] = row
+        b_del.set_label("Точно удалить?")
+
+        def disarm():
+            if menu_state["del_row"] is row:
+                menu_state["del_row"] = None
+                b_del.set_label("Удалить")
+            return False
+
+        GLib.timeout_add(3000, disarm)
+
+    def on_lb_press(lb, ev):
+        if ev.button != 3:
+            return False
+        row = lb.get_row_at_y(int(ev.y))
+        if row is None:
+            return False
+        lb.select_row(row)
+        m = Gtk.Menu()
+        for label, fn in (("Вставить", lambda *_: do_choose(True)),
+                          ("Только копировать", lambda *_: do_choose(False)),
+                          ("Изменить...", start_edit),
+                          ("Удалить", delete_sel)):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", fn)
+            m.append(it)
+        m.show_all()
+        m.popup_at_pointer(ev)
+        return True
+
+    for tab in tabs:
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        lb.set_activate_on_single_click(False)          # клик выделяет, двойной клик или Enter - вставляет
+        lb.set_filter_func(row_matches)
+        lb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        lb.connect("button-press-event", on_lb_press)
+        lb.connect("row-activated", lambda _lb, row: choose(row.osk_text, state["paste"]))
+        sw = Gtk.ScrolledWindow()
+        sw.add(lb)
+        lists.append(lb)
+        nb.append_page(sw, Gtk.Label(label=tab["label"]))
+    for i, tab in enumerate(tabs):
+        fill(i, tab["entries"], tab["name"])
+    GLib.timeout_add(int(cfg["refresh_ms"]), refresh)
+
+    # ---- страница правки записи ----
+    epage = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    el = Gtk.Label(label="Правка записи   (Ctrl+Enter - сохранить, Esc - отмена)")
+    el.set_xalign(0)
+    el.get_style_context().add_class("osk-head")
+    epage.pack_start(el, False, False, 0)
+    esw = Gtk.ScrolledWindow()
+    esw.add(etv)
+    epage.pack_start(esw, True, True, 0)
+    ebar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    e_save = Gtk.Button(label="Сохранить")
+    e_cancel = Gtk.Button(label="Отмена")
+    e_save.connect("clicked", save_edit)
+    e_cancel.connect("clicked", cancel_edit)
+    ebar.pack_start(e_save, False, False, 0)
+    ebar.pack_start(e_cancel, False, False, 0)
+    epage.pack_start(ebar, False, False, 0)
+    stack.add_named(epage, "edit")
+
+    # ---- нижняя панель: кнопки и уголок изменения размера ----
+    bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    b_paste = Gtk.Button(label="Вставить")
+    b_copy = Gtk.Button(label="Копировать")
+    b_edit = Gtk.Button(label="Изменить")
+    b_del = Gtk.Button(label="Удалить")
+    for b in (b_paste, b_copy, b_edit, b_del):
+        b.set_focus_on_click(False)
+        bottom.pack_start(b, False, False, 0)
+    b_paste.connect("clicked", lambda *_: do_choose(True))
+    b_copy.connect("clicked", lambda *_: do_choose(False))
+    b_edit.connect("clicked", start_edit)
+    b_del.connect("clicked", delete_sel)
+    if layer:
+        grip_box = Gtk.EventBox()
+        grip_box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                            Gdk.EventMask.POINTER_MOTION_MASK)
+        grip = Gtk.Label(label="◢  размер")
+        grip.get_style_context().add_class("osk-grip")
+        grip_box.add(grip)
+        bottom.pack_end(grip_box, False, False, 0)
+        rs = {"on": False, "x": 0, "y": 0}
+
+        def g_press(_w, ev):
+            if ev.button == 1:
+                rs.update(on=True, x=ev.x, y=ev.y)
+            return True
+
+        def g_motion(_w, ev):
+            if rs["on"]:
+                geo["w"] = max(360, min(geo["w"] + int(ev.x - rs["x"]), SW - geo["x"]))
+                geo["h"] = max(240, min(geo["h"] + int(ev.y - rs["y"]), SH - geo["y"]))
+                win.set_size_request(geo["w"], geo["h"])
+                win.resize(geo["w"], geo["h"])
+            return True
+
+        def g_release(_w, ev):
+            rs["on"] = False
+            save_geo(geo)
+            return True
+
+        grip_box.connect("button-press-event", g_press)
+        grip_box.connect("motion-notify-event", g_motion)
+        grip_box.connect("button-release-event", g_release)
+    lst.pack_start(bottom, False, False, 0)
+
+    def on_search(entry):
+        state["q"] = entry.get_text().lower()
+        for lb in lists:
+            lb.invalidate_filter()
+
+    def on_search_enter(_entry):
+        lb = lists[nb.get_current_page()]
+        for row in lb.get_children():
+            if row_matches(row):
+                choose(row.osk_text, state["paste"])
+                return
+
+    search.connect("search-changed", on_search)
+    search.connect("activate", on_search_enter)
+
+    def on_key(_w, ev):
+        editing = stack.get_visible_child_name() == "edit"
+        if ev.keyval == Gdk.KEY_Escape:
+            if editing:
+                cancel_edit()
+            else:
+                win.close()
+            return True
+        if editing and ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and ev.state & Gdk.ModifierType.CONTROL_MASK:
+            save_edit()
+            return True
+        if not editing and ev.keyval == Gdk.KEY_Delete and not search.has_focus():
+            delete_sel()
+            return True
+        return False
+
+    win.connect("key-press-event", on_key)
+    if cfg["close_on_focus_out"] and not layer:      # слой overlay: закрытие крестиком, Esc или выбором записи
+        armed = {"on": False}
+        GLib.timeout_add(600, lambda: armed.update(on=True) or False)    # сразу после открытия фокус может прыгать
+        win.connect("focus-out-event", lambda *_: win.close() if armed["on"] else False)
+    return win, nb, lists, search, state
+
+
+def pick_running():
+    try:
+        pid = int(PICK_PID.read_text())
+        if b"clipd" in Path(f"/proc/{pid}/cmdline").read_bytes() and pid != os.getpid():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def cmd_pick_gtk(cfg, paste, toggle=False):
+    pid = pick_running()
+    if pid and toggle:                         # повторный вызов закрывает окно
+        os.kill(pid, signal.SIGTERM)
+        return
+    L = import_layer_shell()                   # до импорта GTK
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import GLib, Gtk
+    except Exception as e:                     # нет GTK - запасное меню
+        log(f"GTK недоступен: {e}")
+        notify("Нет GTK для окна с вкладками: sudo apt install python3-gi gir1.2-gtk-3.0")
+        return cmd_pick_menu(cfg, paste)
+    tabs = collect_tabs(cfg)
+    if not tabs:
+        notify("Буфер пуст")
+        return
+    chosen = {"text": None, "paste": paste}
+
+    def choose(text, do_paste):
+        chosen["text"], chosen["paste"] = text, do_paste
+        win.close()
+
+    win, nb, lists, search, state = build_window(cfg, tabs, choose, L)
+    state["paste"] = paste
+    win.connect("destroy", Gtk.main_quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (win.close(), False)[1])
+    try:
+        PICK_PID.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    win.show_all()
+    search.grab_focus()
+    log(f"окно открыто, вкладок: {len(tabs)}, layer-shell: {bool(L)}")
+    Gtk.main()
+    try:
+        PICK_PID.unlink()
+    except OSError:
+        pass
+    if chosen["text"] is not None:
+        deliver(cfg, chosen["text"], chosen["paste"])
+    else:
+        log("окно закрыто без выбора")
+
+
+def cmd_pick(cfg, paste, toggle=False):
+    if cfg["ui"] == "gtk":
+        cmd_pick_gtk(cfg, paste, toggle)
+    else:
+        cmd_pick_menu(cfg, paste)
+
+
+# ---------- send ----------
+
+def cmd_send(cfg, target):
+    r = subprocess.run(["wl-paste", "--no-newline", "--type", "text"], capture_output=True)
+    text = r.stdout.decode("utf-8", "replace")
+    if r.returncode or not text:
+        notify("Буфер пуст")
+        return
+    if not target:
+        target = menu(cfg, ["all"] + known_devices(cfg), "Отправить \u2192")
+        if not target:
+            return
+    if not re.fullmatch(r"[\w.-]+", target):
+        sys.exit("недопустимое имя устройства")
+    atomic_write(Path(cfg["sync_dir"]) / f"to_{target}.txt", text)
+    notify(f"Отправлено \u2192 {target}")
+
+
+def main():
+    a = sys.argv[1:]
+    cfg = load_cfg()
+    cmd = a[0] if a else "pick"
+    if cmd == "testpaste":
+        return cmd_testpaste(cfg)
+    if cmd == "watch":
+        cmd_watch(cfg)
+    elif cmd == "store":
+        cmd_store(cfg, "--primary" in a)
+    elif cmd == "pick":
+        cmd_pick(cfg, "--paste" in a, "--toggle" in a)
+    elif cmd == "send":
+        cmd_send(cfg, a[1] if len(a) > 1 else None)
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

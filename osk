@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""osk - управление экранной клавиатурой wvkbd по конфигу osk.toml.
+
+Настройки (размер, прозрачность, шрифт, цвета, слои) берутся из osk.toml и
+передаются wvkbd флагами при запуске, поэтому перекомпиляция не нужна.
+
+  osk start | stop | restart   запуск/остановка/перезапуск (применяет osk.toml)
+  osk show | hide | toggle     показать/скрыть (если не запущена - запустит)
+  osk status [--genmon]        состояние: shown | hidden | stopped
+  osk cmd                      показать итоговую командную строку wvkbd
+  osk build                    пересобрать wvkbd-wide (mkwide.py из wide.toml, патчи, make)
+  osk layout en|ru|toggle      сменить раскладку СИСТЕМЫ (физическая клавиатура); слой экранной
+                               клавиатуры подстроится сам. Так делает и кнопка EN/RU на экране
+  osk slot                     для xfce4-panel (плагин «Генератор монитора»): пустое место под значок раскладки
+  osk layer en|ru              выбрать слой экранной клавиатуры (нужен wvkbd, собранный с патчем layout-sync)
+
+Конфиг: $OSK_CONFIG или ~/.config/osk/osk.toml
+"""
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HOME = Path.home()
+CONF = Path(os.environ.get("OSK_CONFIG", HOME / ".config/osk/osk.toml"))
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+STATE = RUN / "osk.state"
+PIDFILE = RUN / "osk.pid"
+SOCK = RUN / "osk-tray.sock"            # команды значку в трее (osk-tray)
+SYNC_MARK = b"OSK_LAYER_SYNC_V1"        # метка в wvkbd, собранном с патчем layout-sync
+TRAY = {}                               # секция [tray] из osk.toml (заполняет load)
+LOG = HOME / ".cache/osk/wvkbd.log"
+
+DEFAULTS = {
+    "binary": "",                      # путь к wvkbd-wide; пусто - искать в PATH и в source_dir
+    "source_dir": str(HOME / "wvkbd"),
+    "height": 300,                     # -H, высота в портретной ориентации
+    "landscape_height": 300,           # -L, высота в ландшафте
+    "font": "Sans 12",                 # --fn
+    "alpha": 235,                      # --alpha 0..255
+    "rounding": 6,                     # -R
+    "layers": [],                      # -l, например ["wideen", "wideru"]
+    "landscape_layers": [],            # --landscape-layers
+    "start_hidden": False,
+    "non_exclusive": True,             # --non-exclusive: не резервировать полосу экрана, панель не сдвигается
+}
+COLOR_FLAGS = {
+    "bg": "--bg", "fg": "--fg", "fg_sp": "--fg-sp", "press": "--press",
+    "press_sp": "--press-sp", "swipe": "--swipe", "swipe_sp": "--swipe-sp",
+    "text": "--text", "text_sp": "--text-sp",
+}
+
+
+def load():
+    data = {}
+    try:
+        with open(CONF, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        print(f"osk: нет конфига {CONF}, работаю с настройками по умолчанию", file=sys.stderr)
+    kb = {**DEFAULTS, **data.get("keyboard", {})}
+    TRAY.clear()
+    TRAY.update(data.get("tray", {}))
+    for k in ("binary", "source_dir"):
+        kb[k] = os.path.expanduser(kb[k]) if kb[k] else kb[k]
+    return kb, data.get("colors", {})
+
+
+def find_binary(kb):
+    cands = [kb["binary"], shutil.which("wvkbd-wide") or "", str(Path(kb["source_dir"]) / "wvkbd-wide")]
+    for c in cands:
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return c
+    sys.exit("osk: не найден wvkbd-wide (задай keyboard.binary в osk.toml или выполни `osk build`)")
+
+
+def build_cmd(kb, colors, hidden):
+    c = [find_binary(kb), "-H", str(kb["height"]), "-L", str(kb["landscape_height"]),
+         "--fn", kb["font"], "--alpha", str(kb["alpha"]), "-R", str(kb["rounding"])]
+    if kb["layers"]:
+        c += ["-l", ",".join(kb["layers"])]
+    if kb["landscape_layers"]:
+        c += ["--landscape-layers", ",".join(kb["landscape_layers"])]
+    for key, flag in COLOR_FLAGS.items():
+        if key in colors:
+            c += [flag, str(colors[key])]
+    if kb["non_exclusive"]:
+        c.append("--non-exclusive")
+    if hidden:
+        c.append("--hidden")
+    return c
+
+
+def wl_env():
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", str(RUN))
+    if "WAYLAND_DISPLAY" not in env:
+        socks = sorted(p.name for p in RUN.glob("wayland-*") if not p.name.endswith(".lock"))
+        env["WAYLAND_DISPLAY"] = socks[0] if socks else "wayland-0"
+    return env
+
+
+def pids(kb):
+    name = Path(kb["binary"] or "wvkbd-wide").name
+    r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", name], capture_output=True, text=True)
+    found = {int(x) for x in r.stdout.split()}
+    try:                                    # pid-файл: на случай, если имя процесса не совпало
+        pid = int(PIDFILE.read_text())
+        if name.encode() in Path(f"/proc/{pid}/cmdline").read_bytes():
+            found.add(pid)
+    except (OSError, ValueError):
+        pass
+    return sorted(found)
+
+
+def set_state(s):
+    try:
+        STATE.write_text(s)
+    except OSError:
+        pass
+
+
+def get_state(kb):
+    if not pids(kb):
+        return "stopped"
+    try:
+        return STATE.read_text().strip() or "shown"
+    except OSError:
+        return "shown"
+
+
+def stop(kb):
+    for p in pids(kb):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(20):
+        if not pids(kb):
+            break
+        time.sleep(0.1)
+    set_state("stopped")
+
+
+def start(kb, colors, hidden=None):
+    if hidden is None:
+        hidden = bool(kb["start_hidden"])
+    stop(kb)
+    cmd = build_cmd(kb, colors, hidden)
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(LOG, "ab")
+    env = wl_env()
+    me = shutil.which("osk") or str(Path(__file__).resolve())
+    env["OSK_LAYOUT_CMD"] = f"{me} layout"      # кнопка EN/RU на экране сообщает системе, какой язык включить
+    p = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, start_new_session=True)
+    PIDFILE.write_text(str(p.pid))
+    time.sleep(0.6)
+    if p.poll() is not None:
+        tail = LOG.read_text(errors="replace").splitlines()[-8:]
+        sys.exit("osk: wvkbd не запустился:\n" + "\n".join(tail))
+    set_state("hidden" if hidden else "shown")
+    cmd_layer(kb, read_sys_layout(), quiet=True)      # слой экранной клавиатуры = текущий язык системы
+
+
+# ---------- раскладка: система <-> экранная клавиатура ----------
+
+def read_sys_layout():
+    """EN / RU - раскладка системы (файл пишет kbd-layout-feeder.sh по xkb-monitor)."""
+    path = os.path.expanduser(TRAY.get("layout_state_file") or str(RUN / "kbd-layout"))
+    try:
+        return Path(path).read_text().strip().upper()[:2]
+    except OSError:
+        return ""
+
+
+def norm_layout(arg):
+    a = (arg or "").strip().lower()
+    if a.startswith("wide"):
+        a = a[4:]
+    if a in ("en", "ru"):
+        return a.upper()
+    if a in ("toggle", "switch", ""):
+        return "TOGGLE"
+    sys.exit("osk: раскладка: en, ru или toggle")
+
+
+def layer_signal(kb, code):
+    """Сигнал wvkbd, выбирающий слой по коду раскладки: SIGRTMIN+N = N-й слой из keyboard.layers."""
+    for i, name in enumerate(kb["layers"] or ["wideen", "wideru"]):
+        if name.lower().endswith(code.lower()):
+            return signal.SIGRTMIN + 1 + i
+    return None
+
+
+def supports_sync(pid):
+    try:
+        return SYNC_MARK in Path(f"/proc/{pid}/exe").read_bytes()
+    except OSError:
+        return False
+
+
+def cmd_layer(kb, code, quiet=False):
+    sig = layer_signal(kb, code) if code in ("EN", "RU") else None
+    if sig is None:
+        return
+    for p in pids(kb):
+        if supports_sync(p):                  # старый wvkbd от такого сигнала завершился бы
+            try:
+                os.kill(p, sig)
+            except ProcessLookupError:
+                pass
+        elif not quiet:
+            print("osk: этот wvkbd собран без патча layout-sync: выполни `osk build` и `osk restart`", file=sys.stderr)
+
+
+def tray_send(msg):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.sendto(msg.encode(), str(SOCK))
+        return True
+    except OSError:                           # значка нет или сокет устарел
+        return False
+    finally:
+        s.close()
+
+
+def inject_toggle():
+    """Смена раскладки без значка: Alt+Shift через виртуальную клавиатуру uinput (нужен доступ к /dev/uinput)."""
+    try:
+        from evdev import UInput, ecodes
+        codes = [getattr(ecodes, k) for k in TRAY.get("toggle_keys", ["KEY_LEFTALT", "KEY_LEFTSHIFT"])]
+        ui = UInput({ecodes.EV_KEY: codes}, name="osk-layout-switch")
+        time.sleep(0.4)                       # compositor должен заметить новое устройство
+        for c in codes:
+            ui.write(ecodes.EV_KEY, c, 1)
+            ui.syn()
+        time.sleep(0.04)
+        for c in reversed(codes):
+            ui.write(ecodes.EV_KEY, c, 0)
+            ui.syn()
+        time.sleep(0.1)
+        ui.close()
+        return True
+    except Exception as e:
+        print(f"osk: не удалось сменить раскладку: {e}", file=sys.stderr)
+        return False
+
+
+def cmd_layout(kb, arg):
+    code = norm_layout(arg)
+    if tray_send("layout " + code.lower()):   # значок держит uinput открытым, отвечает мгновенно
+        return
+    cur = read_sys_layout()
+    target = ("RU" if cur == "EN" else "EN") if code == "TOGGLE" else code
+    if target != cur and inject_toggle():
+        cmd_layer(kb, target, quiet=True)     # значка нет, подстраиваем слой сами
+
+
+def signal_to(kb, sig, state):
+    for p in pids(kb):
+        os.kill(p, sig)
+    set_state(state)
+
+
+def genmon(kb):
+    st = get_state(kb)
+    icon = {"shown": "\u2328 ON", "hidden": "\u2328 off", "stopped": "\u2328 \u2715"}[st]
+    me = shutil.which("osk") or str(Path(__file__).resolve())
+    print(f"<txt>{icon}</txt>")
+    print(f"<txtclick>{me} toggle</txtclick>")
+    print(f"<tool>Экранная клавиатура: {st}</tool>")
+
+
+def slot():
+    """Вывод для плагина genmon панели xfce: прозрачная картинка, которая резервирует в панели место под значок."""
+    img = Path(os.path.realpath(__file__)).parent / "ICONs" / "tray" / "slot.png"
+    print(f"<img>{img}</img>")
+    print("<tool>Здесь значок раскладки (osk-tray)</tool>")
+
+
+def build(kb):
+    src = Path(kb["source_dir"])
+    steps = [["python3", "mkwide.py"]]
+    if (src / "patch_keyboard.py").exists():
+        steps.append(["python3", "patch_keyboard.py"])
+    steps += [["make", "LAYOUT=wide", "clean"], ["make", "LAYOUT=wide", "wvkbd-wide"]]
+    for s in steps:
+        print("osk build:", " ".join(s))
+        r = subprocess.run(s, cwd=src, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit((r.stdout + r.stderr)[-1500:] + f"\nosk: шаг «{' '.join(s)}» завершился с ошибкой")
+        if s[0] == "python3":
+            print("  " + r.stdout.strip().replace("\n", "\n  "))
+    print("osk build: готово, примени командой `osk restart`")
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "toggle"
+    kb, colors = load()
+    st = get_state(kb)
+    if cmd in ("start", "restart"):
+        start(kb, colors)
+    elif cmd == "stop":
+        stop(kb)
+    elif cmd == "show":
+        start(kb, colors, hidden=False) if st == "stopped" else signal_to(kb, signal.SIGUSR2, "shown")
+    elif cmd == "hide":
+        if st != "stopped":
+            signal_to(kb, signal.SIGUSR1, "hidden")
+    elif cmd == "toggle":
+        if st == "stopped":
+            start(kb, colors, hidden=False)
+        else:
+            signal_to(kb, signal.SIGRTMIN, "hidden" if st == "shown" else "shown")
+    elif cmd == "status":
+        genmon(kb) if "--genmon" in a else print(st)
+    elif cmd == "cmd":
+        print(" ".join(build_cmd(kb, colors, bool(kb["start_hidden"]))))
+    elif cmd == "build":
+        build(kb)
+    elif cmd == "slot":
+        slot()
+    elif cmd == "layout":
+        cmd_layout(kb, a[1] if len(a) > 1 else "toggle")
+    elif cmd == "layer":
+        cmd_layer(kb, norm_layout(a[1] if len(a) > 1 else "").replace("TOGGLE", ""))
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

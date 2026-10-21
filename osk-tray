@@ -1,0 +1,1619 @@
+#!/usr/bin/env python3
+"""osk-tray - значок раскладки и экранной клавиатуры.
+
+  левый клик          сменить раскладку системы (физической клавиатуры) - экранная клавиатура переключается следом
+  двойной клик        показать/скрыть экранную клавиатуру
+  средний клик        команда middle_click (по умолчанию - показать/скрыть окно истории буфера)
+  правый клик         меню (osk.toml, [[tray.menu]]); если экранная клавиатура на экране - меню над ней,
+                      иначе над значком; клавиатура при этом НЕ прячется
+
+Значок плавающий (поверх всех окон, фокус не берёт): его можно перетащить левой кнопкой, положение запоминается
+(по умолчанию - правый верхний угол). Панельный слот (genmon) больше не нужен.
+
+Режимы (osk.toml: [tray] mode):
+  layer  (по умолчанию) плавающий значок, меню и окна над клавиатурой.
+  sni    запасной: значок в области уведомлений панели, как у остальных значков, с меню панели.
+         Панель при клике забирает фокус; значок сразу возвращает его прежнему окну. Пока открыто меню,
+         экранная клавиатура временно прячется (иначе она закрывает меню) и потом возвращается.
+  auto   layer, если доступен, иначе sni.
+
+Значок: flag-<язык>.png, когда экранная клавиатура скрыта, и kbd-<язык>.png, когда показана
+(папка ICONs/tray рядом с этим файлом). Если картинок нет - рисуется плитка EN/RU.
+Раскладка системы читается из файла состояния (его пишет kbd-layout-feeder.sh по xkb-monitor).
+Смена раскладки: имитация Alt+Shift через виртуальное устройство uinput (нужен доступ к /dev/uinput).
+Слой экранной клавиатуры подстраивается под язык системы командой `osk layer en|ru`.
+
+Управление из терминала (в том числе по SSH, переменные Wayland подбираются сами):
+  osk-tray start | stop | restart | status    запуск в фоне / остановка / перезапуск / состояние
+  osk-tray dblclick [мс]                       показать / задать время двойного клика
+  osk-tray hide | show | toggle                явно скрыть / показать / переключить экранную клавиатуру
+  osk-tray layout en|ru|toggle | place | menu  команда работающему значку
+  osk-tray diag                                что доступно (layer-shell, Wayland) и запущен ли значок
+
+Запуск (из ~/.config/labwc/autostart):  ~/.local/bin/osk-tray &
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+try:
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf  # noqa: E402
+except (ValueError, ImportError):
+    GdkPixbuf = None
+
+Gtk = Gdk = GtkLayerShell = None
+GTK_WHY = ""                                    # почему режим layer недоступен (для диагностики)
+
+
+def import_gtk():
+    """GTK и gtk-layer-shell нужны только режиму layer. GtkLayerShell подключаем раньше Gtk (порядок загрузки библиотек)."""
+    global Gtk, Gdk, GtkLayerShell, GTK_WHY
+    try:
+        gi.require_version("GtkLayerShell", "0.1")
+        from gi.repository import GtkLayerShell as L  # noqa: E402
+    except (ValueError, ImportError) as e:
+        GTK_WHY = "не установлен gtk-layer-shell: sudo apt install gir1.2-gtklayershell-0.1 (" + str(e) + ")"
+        return False
+    try:
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk as D, Gtk as G  # noqa: E402
+    except (ValueError, ImportError) as e:
+        GTK_WHY = "не найден GTK 3: sudo apt install gir1.2-gtk-3.0 (" + str(e) + ")"
+        return False
+    Gtk, Gdk, GtkLayerShell = G, D, L
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        GTK_WHY = "нет переменной WAYLAND_DISPLAY (запуск не из сеанса Wayland)"
+        return False
+    if not L.is_supported():
+        GTK_WHY = "композитор не поддерживает layer-shell"
+        return False
+    return True
+
+
+HOME = Path.home()
+UID = os.getuid()
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{UID}"))
+CONF = Path(os.environ.get("OSK_CONFIG", HOME / ".config/osk/osk.toml"))
+HERE = Path(os.path.realpath(__file__)).parent          # папка проекта (osk-tray - ссылка на файл в ней)
+SOCK = RUN / "osk-tray.sock"                            # сюда пишут `osk layout` и `osk-tray <команда>`
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk" / "tray-pos.json"
+
+ICON_SIZES = [16, 22, 24, 32, 48, 64]
+DEBUG = bool(os.environ.get("OSK_TRAY_DEBUG"))
+
+DEFAULTS = {
+    "mode": "layer",                    # layer - значок-окно в слоте панели (рекомендуется) | sni - значок самой панели | auto
+    "layout_state_file": "",            # по умолчанию $XDG_RUNTIME_DIR/kbd-layout
+    "poll_ms": 150,
+    "osk_poll_ms": 1000,
+    "double_click_ms": 1200,
+    "left_click": "layout",             # layout или любая команда оболочки
+    "double_click": "~/.local/bin/osk toggle",
+    "middle_click": "~/.local/bin/clipd pick --paste --toggle",   # окно истории буфера (повтор закрывает)
+    "toggle_keys": ["KEY_LEFTALT", "KEY_LEFTSHIFT"],   # комбинация смены раскладки в системе
+    "sync_layer": True,                 # переключать слой экранной клавиатуры вслед за системной раскладкой
+    "colors": {"EN": "1e5fd8", "RU": "c8372d"},
+    "default_color": "555555",
+    "osk": "~/.local/bin/osk",
+    "icons_dir": "",                    # по умолчанию ICONs/tray рядом с osk-tray
+    "icon_hidden": "flag-{layout}.png",   # {layout} -> en / ru (строчными)
+    "icon_shown": "kbd-{layout}.png",
+    # --- режим layer ---
+    "icon_size": 28,                    # размер значка, px
+    "icon_x": -1,                       # положение по умолчанию (px от левого верхнего угла); -1 = у правого нижнего угла
+    "icon_y": -1,
+    "icon_margin_right": 12,
+    "icon_margin_top": 12,
+    "icon_drag": True,           # для автоматического положения: отступ от правого края (оставьте место под часы/трей)
+    "panel_height": 0,                  # высота панели, px; 0 = определить по положению значка (панель снизу ~ 2*отступ значка от низа)
+    "menu_gap": 6,                      # зазор между меню и клавиатурой/значком
+    "menu_bg": "262626",                # цвета меню (rrggbb)
+    "menu_fg": "f0f0f0",
+    "menu_hover": "3d6fd8",
+    "menu_width": 300,                  # ширина меню, px
+    # --- режим sni ---
+    "menu_ui": "panel",                 # panel - меню значка рисует панель | fuzzel - своё окно (нужен fuzzel)
+    "menu_hide_keyboard": True,         # пока открыто меню панели, экранная клавиатура прячется (иначе она закрывает меню)
+    "restore_focus": True,              # после клика по значку вернуть фокус окну, у которого его забрала панель
+    "panel_ids": ["panel"],             # части app_id окон панели (они не считаются «рабочими» окнами)
+    "menu_anchor": "bottom-right",
+    "menu_x_margin": 8,
+    "menu_y_margin": 48,
+    "menu_width_chars": 36,
+}
+DEFAULT_MENU = [
+    {"label": "Открыть историю буфера обмена", "command": "~/.local/bin/clipd pick --paste"},
+    {"label": "Показать / скрыть клавиатуру", "command": "~/.local/bin/osk toggle"},
+    {"label": "Открепить клавиатуру (скоро)", "command": "~/.local/bin/osk float", "enabled": False},
+    {"separator": True},
+    {"label": "Переместить значок", "command": "place"},
+    {"label": "Настройки (osk.toml)", "command": "mousepad ~/.config/osk/osk.toml"},
+    {"label": "Перезапустить клавиатуру", "command": "~/.local/bin/osk restart"},
+    {"separator": True},
+    {"label": "Выход", "command": "quit"},
+]
+
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/MenuBar"
+SNI_IFACE = "org.kde.StatusNotifierItem"
+MENU_IFACE = "com.canonical.dbusmenu"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/MenuBar"
+SNI_IFACE = "org.kde.StatusNotifierItem"
+MENU_IFACE = "com.canonical.dbusmenu"
+WATCHER = "org.kde.StatusNotifierWatcher"
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="u" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionMovieName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <method name="ContextMenu"><arg type="i" name="x" direction="in"/><arg type="i" name="y" direction="in"/></method>
+    <method name="Activate"><arg type="i" name="x" direction="in"/><arg type="i" name="y" direction="in"/></method>
+    <method name="SecondaryActivate"><arg type="i" name="x" direction="in"/><arg type="i" name="y" direction="in"/></method>
+    <method name="Scroll"><arg type="i" name="delta" direction="in"/><arg type="s" name="orientation" direction="in"/></method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewOverlayIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus"><arg type="s" name="status"/></signal>
+  </interface>
+</node>
+"""
+
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg type="i" name="parentId" direction="in"/>
+      <arg type="i" name="recursionDepth" direction="in"/>
+      <arg type="as" name="propertyNames" direction="in"/>
+      <arg type="u" name="revision" direction="out"/>
+      <arg type="(ia{sv}av)" name="layout" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" name="ids" direction="in"/>
+      <arg type="as" name="propertyNames" direction="in"/>
+      <arg type="a(ia{sv})" name="properties" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" name="id" direction="in"/>
+      <arg type="s" name="name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg type="i" name="id" direction="in"/>
+      <arg type="s" name="eventId" direction="in"/>
+      <arg type="v" name="data" direction="in"/>
+      <arg type="u" name="timestamp" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" name="events" direction="in"/>
+      <arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg type="i" name="id" direction="in"/>
+      <arg type="b" name="needUpdate" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" name="ids" direction="in"/>
+      <arg type="ai" name="updatesNeeded" direction="out"/>
+      <arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})" name="updatedProps"/>
+      <arg type="a(ias)" name="removedProps"/>
+    </signal>
+    <signal name="LayoutUpdated">
+      <arg type="u" name="revision"/>
+      <arg type="i" name="parent"/>
+    </signal>
+    <signal name="ItemActivationRequested">
+      <arg type="i" name="id"/>
+      <arg type="u" name="timestamp"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+def load_cfg():
+    data = {}
+    try:
+        with open(CONF, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        pass
+    t = data.get("tray", {})
+    cfg = {**DEFAULTS, **{k: v for k, v in t.items() if k != "menu"}}
+    cfg["colors"] = {**DEFAULTS["colors"], **t.get("colors", {})}
+    cfg["menu"] = t.get("menu") or DEFAULT_MENU
+    k = data.get("keyboard", {})
+    cfg["kbd_h"] = int(k.get("landscape_height", k.get("height", 300)))     # высота клавиатуры на экране 1920x1080
+    if not cfg["layout_state_file"]:
+        cfg["layout_state_file"] = str(RUN / "kbd-layout")
+    cfg["icons_dir"] = Path(os.path.expanduser(cfg["icons_dir"])) if cfg["icons_dir"] else HERE / "ICONs" / "tray"
+    return cfg
+
+
+
+# ---------- картинки ----------
+
+def argb_from_rgba(px, w, h, rowstride):
+    """Пиксели RGBA (с отступом строки) -> ARGB32 для StatusNotifierItem (порядок байт: A R G B)."""
+    out = bytearray(w * h * 4)
+    for y in range(h):
+        row = px[y * rowstride: y * rowstride + w * 4]
+        o = y * w * 4
+        out[o:o + w * 4:4] = row[3::4]
+        out[o + 1:o + w * 4:4] = row[0::4]
+        out[o + 2:o + w * 4:4] = row[1::4]
+        out[o + 3:o + w * 4:4] = row[2::4]
+    return bytes(out)
+
+
+def pixbuf_to_pixmap(pb):
+    if not pb.get_has_alpha():
+        pb = pb.add_alpha(False, 0, 0, 0)
+    w, h = pb.get_width(), pb.get_height()
+    return (w, h, argb_from_rgba(pb.get_pixels(), w, h, pb.get_rowstride()))
+
+
+def pixmaps_variant(pm):
+    """a(iiay) из списка (w, h, bytes). GLib.Variant("a(iiay)", ...) напрямую очень медленный на Pi."""
+    items = []
+    for w, h, data in pm:
+        ay = GLib.Variant.new_from_bytes(GLib.VariantType("ay"), GLib.Bytes.new(data), True)
+        items.append(GLib.Variant.new_tuple(GLib.Variant("i", w), GLib.Variant("i", h), ay))
+    return GLib.Variant.new_array(GLib.VariantType("(iiay)"), items)
+
+
+def pixmaps_from_png(path):
+    out = []
+    for s in ICON_SIZES:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), s, s, True)
+        out.append(pixbuf_to_pixmap(pb))
+    return out
+
+
+def svg_tile(text, bg, osk_shown):
+    dot = ('<circle cx="54" cy="12" r="8" fill="#3ddc84" stroke="#ffffff" stroke-width="3"/>'
+           if osk_shown else "")
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">'
+            f'<rect x="2" y="10" width="60" height="46" rx="10" fill="#{bg}"/>'
+            '<text x="32" y="44" font-family="DejaVu Sans, Sans" font-weight="bold" font-size="30" '
+            f'text-anchor="middle" fill="#ffffff">{text}</text>{dot}</svg>')
+
+
+def pixmaps_from_svg(svg):
+    out = []
+    for s in (16, 22, 24, 32, 48, 64):
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.set_size(s, s)
+        loader.write(svg.encode("utf-8"))
+        loader.close()
+        out.append(pixbuf_to_pixmap(loader.get_pixbuf()))
+    return out
+
+
+def dbg(*a):
+    if DEBUG:
+        print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+
+
+def run_cmd(cmd):
+    subprocess.Popen(["sh", "-c", os.path.expanduser(cmd) if cmd.startswith("~") else cmd],
+                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(msg):
+    if shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", "osk-tray", "-t", "4000", "osk-tray", msg])
+
+
+class LayoutSwitcher:
+    """Смена раскладки системы: нажатие Alt+Shift на виртуальной uinput-клавиатуре."""
+
+    def __init__(self, keys):
+        self.keys = keys
+        self.ui = None
+        self.error = None
+        self.connect()
+
+    def connect(self):
+        try:
+            from evdev import UInput, ecodes
+            self.ec = ecodes
+            self.codes = [getattr(ecodes, k) for k in self.keys]
+            self.ui = UInput({ecodes.EV_KEY: self.codes}, name="osk-layout-switch")
+            self.error = None
+            time.sleep(0.3)                  # compositor должен подхватить новое устройство
+        except Exception as e:               # нет python-evdev или нет прав на /dev/uinput
+            self.ui = None
+            self.error = str(e)
+
+    def toggle(self):
+        if not self.ui:
+            self.connect()                   # вдруг права уже выданы
+        if not self.ui:
+            notify("Не могу сменить раскладку: нет доступа к /dev/uinput (" + str(self.error) + ")")
+            return False
+        for c in self.codes:
+            self.ui.write(self.ec.EV_KEY, c, 1)
+            self.ui.syn()
+        time.sleep(0.04)
+        for c in reversed(self.codes):
+            self.ui.write(self.ec.EV_KEY, c, 0)
+            self.ui.syn()
+        return True
+
+def logf(msg):
+    """Строка в ~/.cache/osk/tray.log (для диагностики на устройстве)."""
+    try:
+        log = HOME / ".cache/osk/tray.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a") as f:
+            f.write(time.strftime("%F %T ") + msg + "\n")
+    except OSError:
+        pass
+
+
+class Toplevels:
+    """Список окон и их состояния (wlr-foreign-toplevel-management, сырой протокол Wayland, без библиотек).
+    Нужен, чтобы вернуть фокус окну, у которого его отняла панель при клике по значку,
+    и (дальше) узнавать про полноэкранные окна."""
+
+    def __init__(self, panel_ids=("panel",), on_change=None):
+        self.ok = False
+        self.panel_ids = [p.lower() for p in panel_ids]
+        self.on_change = on_change
+        self.items = {}
+        self.last_active = None
+        self.buf = b""
+        try:
+            self.connect()
+        except Exception as e:                  # нет Wayland или композитор без протокола
+            dbg("список окон недоступен:", e)
+            logf("список окон недоступен: " + str(e))
+
+    @staticmethod
+    def _pad(b):
+        return b + b"\0" * ((4 - len(b) % 4) % 4)
+
+    def _str(self, text):
+        b = text.encode() + b"\0"
+        return struct.pack("<I", len(b)) + self._pad(b)
+
+    def _send(self, obj, op, payload=b""):
+        self.sock.sendall(struct.pack("<II", obj, ((8 + len(payload)) << 16) | op) + payload)
+
+    @staticmethod
+    def _rd_str(body):
+        (ln,) = struct.unpack("<I", body[:4])
+        return body[4:4 + max(ln - 1, 0)].decode("utf-8", "replace")
+
+    def connect(self):
+        name = os.environ.get("WAYLAND_DISPLAY")
+        if not name:
+            raise OSError("нет WAYLAND_DISPLAY")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(name if name.startswith("/") else str(RUN / name))
+        self.sock = s
+        self._send(1, 1, struct.pack("<I", 2))          # wl_display.get_registry -> id 2
+        self._send(1, 0, struct.pack("<I", 3))          # wl_display.sync -> id 3
+        globs, buf, done = {}, b"", False
+        s.settimeout(3)
+        while not done:
+            data = s.recv(65536)
+            if not data:
+                raise OSError("соединение закрыто")
+            buf += data
+            while len(buf) >= 8:
+                obj, so = struct.unpack("<II", buf[:8])
+                size, op = so >> 16, so & 0xFFFF
+                if size < 8 or len(buf) < size:
+                    break
+                body, buf = buf[8:size], buf[size:]
+                if obj == 2 and op == 0:                # registry.global
+                    num, ln = struct.unpack("<II", body[:8])
+                    iface = body[8:8 + ln - 1].decode()
+                    off = 8 + ((ln + 3) & ~3)
+                    globs[iface] = (num, struct.unpack("<I", body[off:off + 4])[0])
+                elif obj == 3:
+                    done = True
+        s.settimeout(None)
+        if "zwlr_foreign_toplevel_manager_v1" not in globs or "wl_seat" not in globs:
+            raise OSError("композитор без wlr-foreign-toplevel-management")
+        num, ver = globs["wl_seat"]
+        self._send(2, 0, struct.pack("<I", num) + self._str("wl_seat") + struct.pack("<II", min(ver, 4), 4))
+        num, ver = globs["zwlr_foreign_toplevel_manager_v1"]
+        self._send(2, 0, struct.pack("<I", num) + self._str("zwlr_foreign_toplevel_manager_v1")
+                   + struct.pack("<II", min(ver, 3), 5))
+        self.seat, self.mgr = 4, 5
+        s.setblocking(False)
+        self.buf = buf
+        self.ok = True
+        GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, s.fileno(), GLib.IOCondition.IN | GLib.IOCondition.HUP,
+                              self.on_data)
+        self.parse()
+
+    def on_data(self, fd, cond):
+        try:
+            data = self.sock.recv(65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            data = b""
+        if not data:
+            self.ok = False
+            return False
+        self.buf += data
+        self.parse()
+        return True
+
+    def parse(self):
+        buf = self.buf
+        while len(buf) >= 8:
+            obj, so = struct.unpack("<II", buf[:8])
+            size, op = so >> 16, so & 0xFFFF
+            if size < 8 or len(buf) < size:
+                break
+            body, buf = buf[8:size], buf[size:]
+            try:
+                self.event(obj, op, body)
+            except Exception as e:                      # неожиданный пакет не должен ронять значок
+                dbg("список окон: ошибка разбора:", e)
+        self.buf = buf
+
+    def event(self, obj, op, body):
+        if obj == self.mgr:
+            if op == 0:
+                (hid,) = struct.unpack("<I", body[:4])
+                self.items[hid] = {"app_id": "", "title": "", "state": set(), "p": {}}
+            elif op == 1:
+                self.ok = False
+            return
+        it = self.items.get(obj)
+        if it is None:
+            return
+        if op == 0:
+            it["p"]["title"] = self._rd_str(body)
+        elif op == 1:
+            it["p"]["app_id"] = self._rd_str(body)
+        elif op == 4:
+            (ln,) = struct.unpack("<I", body[:4])
+            arr = body[4:4 + ln]
+            it["p"]["state"] = {struct.unpack("<I", arr[i:i + 4])[0] for i in range(0, ln - ln % 4, 4)}
+        elif op == 5:                                   # done: применить накопленные изменения
+            it.update(it.pop("p"))
+            it["p"] = {}
+            if 2 in it["state"] and not self.is_panel(obj):
+                self.last_active = obj
+            self.changed()
+        elif op == 6:                                   # closed
+            self.items.pop(obj, None)
+            if self.last_active == obj:
+                self.last_active = None
+            self.changed()
+
+    def changed(self):
+        if self.on_change:
+            self.on_change()
+
+    def is_panel(self, hid):
+        app = self.items.get(hid, {}).get("app_id", "").lower()
+        return any(p in app for p in self.panel_ids)
+
+    def active_id(self):
+        for hid, it in self.items.items():
+            if 2 in it["state"]:
+                return hid
+        return None
+
+    def fullscreen_active(self):
+        hid = self.active_id()
+        return hid if hid is not None and 3 in self.items[hid]["state"] else None
+
+    def activate(self, hid):
+        self._send(hid, 4, struct.pack("<I", self.seat))     # zwlr_foreign_toplevel_handle_v1.activate(seat)
+
+    def refocus(self):
+        """Безусловно вернуть фокус последнему рабочему окну (после окна истории на слое overlay)."""
+        if not self.ok:
+            return False
+        la = self.last_active
+        if la in self.items and 1 not in self.items[la]["state"]:
+            dbg("refocus: окно", self.items[la]["app_id"], "|", self.items[la]["title"])
+            logf("refocus: возвращаю фокус окну " + self.items[la]["app_id"] + " | " + self.items[la]["title"])
+            self.activate(la)
+            return True
+        logf("refocus: некому возвращать фокус (последнее рабочее окно неизвестно или свёрнуто)")
+        return False
+
+    def restore(self):
+        """Вернуть фокус последнему рабочему окну, если сейчас в фокусе панель или ничего."""
+        if not self.ok:
+            return False
+        cur = self.active_id()
+        if cur is not None and not self.is_panel(cur):
+            return False
+        la = self.last_active
+        if la in self.items and 1 not in self.items[la]["state"]:
+            dbg("возвращаю фокус окну", self.items[la]["app_id"], "|", self.items[la]["title"])
+            self.activate(la)
+            return True
+        return False
+
+
+class Core:
+    """Состояние и действия, общие для обоих видов значка."""
+
+    def __init__(self, cfg, loop):
+        self.cfg = cfg
+        self.loop = loop
+        self.layout = "?"
+        self.osk_shown = False
+        self.pending = None
+        self.switcher = LayoutSwitcher(cfg["toggle_keys"])
+        self.top = Toplevels(cfg["panel_ids"])
+        self.read_layout()
+        self.read_osk()
+        self.open_socket()
+        GLib.timeout_add(cfg["poll_ms"], self.tick_layout)
+        GLib.timeout_add(cfg["osk_poll_ms"], self.tick_osk)
+        GLib.timeout_add(1500, self.sync_layer_once)    # слой клавиатуры = язык системы (если клавиатура уже запущена)
+
+    # ---- команды от `osk` и из терминала ----
+    def open_socket(self):
+        try:
+            SOCK.unlink()
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_NONBLOCK)
+        self.sock.bind(str(SOCK))
+        GLib.unix_fd_add_full(GLib.PRIORITY_DEFAULT, self.sock.fileno(), GLib.IOCondition.IN, self.on_sock)
+
+    def on_sock(self, fd, cond):
+        try:
+            words = self.sock.recv(512).decode(errors="replace").split()
+        except OSError:
+            return True
+        dbg("команда по сокету:", words)
+        if words:
+            if words[0] == "layout":
+                self.set_layout(words[1] if len(words) > 1 else "toggle")
+            elif words[0] == "place":
+                self.place()
+            elif words[0] == "menu":
+                self.show_menu()
+            elif words[0] == "refocus":
+                self.top.refocus()
+            elif words[0] == "quit":
+                self.loop.quit()
+        return True
+
+    # ---- раскладка ----
+    def set_layout(self, arg):
+        cur = self.layout
+        target = {"en": "EN", "ru": "RU"}.get(arg.lower())
+        if arg.lower() in ("toggle", "switch", ""):
+            target = "RU" if cur == "EN" else "EN"
+        dbg("смена раскладки:", cur, "->", target)
+        if target is None or target == cur:
+            return
+        if self.switcher.toggle():
+            for ms in (60, 200, 500):                    # дождаться, пока feeder обновит файл раскладки
+                GLib.timeout_add(ms, self.refresh_once)
+
+    synced = None                    # язык, о котором экранной клавиатуре уже сообщили
+    sync_proc = None
+    osk_pid = None
+
+    def sync_layer(self):
+        """Сказать экранной клавиатуре, какой сейчас язык. Не зависит от того, КТО заметил смену языка
+        (периодическая проверка или проверка после клика): ориентир - что клавиатуре ещё не сообщали.
+        Одновременно идёт одна команда, чтобы две подряд не обогнали друг друга."""
+        if not self.cfg["sync_layer"] or self.layout not in ("EN", "RU") or self.layout == self.synced:
+            return
+        if self.sync_proc is not None and self.sync_proc.poll() is None:
+            return                                         # предыдущая ещё работает: повторим на следующем такте
+        self.synced = self.layout
+        dbg("слой экранной клавиатуры ->", self.layout)
+        logf("слой экранной клавиатуры -> " + self.layout)
+        try:
+            self.sync_proc = subprocess.Popen([os.path.expanduser(self.cfg["osk"]), "layer", self.layout.lower()],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                              start_new_session=True)
+        except OSError as e:
+            self.synced = None
+            logf("не удалось выполнить osk layer: " + str(e))
+
+    def sync_layer_once(self):
+        self.synced = None
+        self.sync_layer()
+        return False
+
+    # ---- состояние ----
+    def read_layout(self):
+        try:
+            self.layout = Path(os.path.expanduser(self.cfg["layout_state_file"])).read_text().strip().upper()[:2] or "?"
+        except OSError:
+            self.layout = "?"
+
+    def read_osk(self):
+        try:                                   # то же, что делает `osk status`, но без запуска процесса
+            pid = int((RUN / "osk.pid").read_text())
+            alive = b"wvkbd" in Path(f"/proc/{pid}/cmdline").read_bytes()
+            state = (RUN / "osk.state").read_text().strip() if alive else "stopped"
+            self.osk_shown = state == "shown"
+        except (OSError, ValueError):
+            try:
+                r = subprocess.run([os.path.expanduser(self.cfg["osk"]), "status"],
+                                   capture_output=True, text=True, timeout=3)
+                self.osk_shown = r.stdout.strip() == "shown"
+            except (OSError, subprocess.TimeoutExpired):
+                self.osk_shown = False
+
+    def tick_layout(self):
+        old = self.layout
+        self.read_layout()
+        if self.layout != old:
+            self.announce()
+        self.sync_layer()                                  # каждый такт: догоняем, если клавиатуре не сообщили
+        return True
+
+    def tick_osk(self):
+        old = self.osk_shown
+        self.read_osk()
+        try:                                               # клавиатуру перезапустили: она снова на слое по умолчанию
+            pid = (RUN / "osk.pid").read_text().strip()
+        except OSError:
+            pid = None
+        if pid != self.osk_pid or (self.osk_shown and not old):
+            self.osk_pid = pid
+            self.synced = None
+        if self.osk_shown != old:
+            self.announce()
+        return True
+
+    def announce(self):
+        dbg("значок обновлён: раскладка", self.layout, "клавиатура", "показана" if self.osk_shown else "скрыта")
+        self.changed()
+
+    def changed(self):
+        pass
+
+    def icon_file(self, layout=None, shown=None):
+        layout = self.layout if layout is None else layout
+        shown = self.osk_shown if shown is None else shown
+        key = self.cfg["icon_shown" if shown else "icon_hidden"]
+        return self.cfg["icons_dir"] / key.format(layout=layout.lower())
+
+    def tooltip_text(self):
+        osk = "показана" if self.osk_shown else "скрыта"
+        return (f"Раскладка: {self.layout}\nЭкранная клавиатура: {osk}\n"
+                "ЛКМ - сменить язык, двойной клик - показать/скрыть, ПКМ - меню")
+
+    # ---- действия ----
+    def focus_restore(self, delay=40):
+        """Панель забирает фокус при клике по значку: через мгновение возвращаем его прежнему окну."""
+        if self.cfg["restore_focus"]:
+            GLib.timeout_add(delay, lambda: (self.top.restore(), False)[1])
+
+    def show_menu(self):
+        pass
+
+    def place(self):
+        notify("Перемещение значка работает только в режиме layer")
+
+    def do(self, action):
+        if action == "layout":
+            self.set_layout("toggle")
+        elif action == "place":
+            self.place()
+        elif action == "quit":
+            self.loop.quit()
+        elif action:
+            run_cmd(action)
+        GLib.timeout_add(500, self.refresh_once)
+
+    def refresh_once(self):
+        self.read_layout()
+        self.read_osk()
+        self.announce()
+        return False
+
+    def left_click(self):
+        if not self.cfg["double_click"]:              # двойной клик отключён - реагируем сразу
+            self.do(self.cfg["left_click"])
+            return
+        if self.pending is not None:                 # второй клик в окне ожидания
+            GLib.source_remove(self.pending)
+            self.pending = None
+            self.do(self.cfg["double_click"])
+        else:
+            self.pending = GLib.timeout_add(self.cfg["double_click_ms"], self.single)
+
+    def single(self):
+        self.pending = None
+        self.do(self.cfg["left_click"])
+        return False
+
+
+
+class SniTray(Core):
+    """Значок в области уведомлений панели (StatusNotifierItem + меню dbusmenu)."""
+
+    def __init__(self, cfg, loop):
+        super().__init__(cfg, loop)
+        self.pix_cache = {}
+        self.var_cache = {}
+        self.menu_busy = False
+        self.menu_items = self.build_menu_items()
+        self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        # Свойство Menu объявляем только в режиме panel: если оно есть, панель считает, что у значка своё меню,
+        # и (при menu-is-primary) открывает его по левому клику вместо вызова Activate.
+        sni_xml = SNI_XML if cfg["menu_ui"] == "panel" else SNI_XML.replace(
+            '<property name="Menu" type="o" access="read"/>', "")
+        self.sni_info = Gio.DBusNodeInfo.new_for_xml(sni_xml).interfaces[0]
+        self.menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        self.conn.register_object(SNI_PATH, self.sni_info, self.on_sni_call, self.on_sni_get, None)
+        self.conn.register_object(MENU_PATH, self.menu_info, self.on_menu_call, self.on_menu_get, None)
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.have_name = False
+        self.watcher_up = False
+        Gio.bus_own_name_on_connection(self.conn, self.bus_name, Gio.BusNameOwnerFlags.NONE,
+                                       self.on_name_acquired, self.on_name_lost)
+        Gio.bus_watch_name_on_connection(self.conn, WATCHER, Gio.BusNameWatcherFlags.NONE,
+                                         self.on_watcher_appeared, self.on_watcher_vanished)
+        self.pixmaps_variant()                     # подготовить значок до регистрации в панели
+        GLib.idle_add(self.prewarm().__next__)
+
+    def changed(self):
+        for sig in ("NewIcon", "NewToolTip"):
+            self.conn.emit_signal(None, SNI_PATH, SNI_IFACE, sig, None)
+
+    # ---- регистрация в панели ----
+    # Регистрируемся в панели только когда имя уже наше и панель (watcher) на шине: иначе панель
+    # обратится к имени раньше, чем оно занято, получит ServiceUnknown и может отбросить значок.
+    def on_name_acquired(self, conn, name):
+        dbg("имя занято:", name)
+        self.have_name = True
+        self.try_register()
+
+    def on_name_lost(self, conn, name):
+        print("osk-tray: имя", name, "потеряно или не получено", file=sys.stderr, flush=True)
+        self.have_name = False
+
+    def on_watcher_appeared(self, conn, name, owner):
+        dbg("watcher на шине:", owner)
+        self.watcher_up = True
+        self.try_register()
+
+    def on_watcher_vanished(self, conn, name):
+        dbg("watcher исчез (панель перезапущена?)")
+        self.watcher_up = False
+
+    def try_register(self):
+        if not (self.have_name and self.watcher_up):
+            return
+        dbg("регистрируюсь в панели как", self.bus_name)
+        self.conn.call(WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisterStatusNotifierItem",
+                       GLib.Variant("(s)", (self.bus_name,)), None, Gio.DBusCallFlags.NONE, -1, None,
+                       self.on_registered)
+
+    def on_registered(self, conn, res):
+        try:
+            conn.call_finish(res)
+            dbg("панель приняла регистрацию")
+        except GLib.Error as e:
+            print("osk-tray: не удалось зарегистрироваться в панели:", e.message, file=sys.stderr, flush=True)
+
+    def build_menu_items(self):
+        items = []
+        for i, it in enumerate(self.cfg["menu"], start=1):
+            if it.get("separator"):
+                props = {"type": GLib.Variant("s", "separator")}
+            else:
+                props = {"label": GLib.Variant("s", it.get("label", "?").replace("_", "__")),
+                         "enabled": GLib.Variant("b", bool(it.get("enabled", True))),
+                         "visible": GLib.Variant("b", True)}
+            items.append((i, props, it.get("command", "")))
+        return items
+
+    def prewarm(self):
+        """По одному состоянию за проход главного цикла: значок потом меняется мгновенно."""
+        for layout in ("EN", "RU"):
+            for shown in (False, True):
+                self.pixmaps_variant(layout, shown)
+                yield True
+        yield False
+
+    def pixmaps_variant(self, layout=None, shown=None):
+        layout = self.layout if layout is None else layout
+        shown = self.osk_shown if shown is None else shown
+        key = (layout, shown, str(self.icon_file(layout, shown)))
+        if key not in self.var_cache:
+            self.var_cache[key] = pixmaps_variant(self.icon_pixmaps(layout, shown))
+        return self.var_cache[key]
+
+    def icon_pixmaps(self, layout=None, shown=None):
+        layout = self.layout if layout is None else layout
+        shown = self.osk_shown if shown is None else shown
+        if GdkPixbuf is None:
+            return []
+        f = self.icon_file(layout, shown)
+        key = (str(f), layout, shown)
+        if key not in self.pix_cache:
+            try:
+                if f.is_file():
+                    self.pix_cache[key] = pixmaps_from_png(f)
+                else:
+                    bg = self.cfg["colors"].get(layout, self.cfg["default_color"])
+                    self.pix_cache[key] = pixmaps_from_svg(svg_tile(layout, bg, shown))
+            except Exception as e:             # нет загрузчика PNG/SVG - останется стандартный значок
+                print("osk-tray: не удалось подготовить значок:", e, file=sys.stderr)
+                self.pix_cache[key] = []
+        return self.pix_cache[key]
+
+    def on_sni_get(self, conn, sender, path, iface, name):
+        dbg("запрос свойства", name, "от", sender)
+        v = GLib.Variant
+        if name == "IconPixmap":
+            return self.pixmaps_variant()
+        if name == "IconName":
+            return v("s", "" if self.icon_pixmaps() else "input-keyboard")
+        if name == "ToolTip":
+            return v("(sa(iiay)ss)", ("", [], "Экранная клавиатура", self.tooltip_text()))
+        if name == "Menu":
+            return v("o", MENU_PATH)
+        return {
+            "Category": lambda: v("s", "ApplicationStatus"),
+            "Id": lambda: v("s", "osk-tray"),
+            "Title": lambda: v("s", "Раскладка и экранная клавиатура"),
+            "Status": lambda: v("s", "Active"),
+            "WindowId": lambda: v("u", 0),
+            "OverlayIconName": lambda: v("s", ""),
+            "OverlayIconPixmap": lambda: v("a(iiay)", []),
+            "AttentionIconName": lambda: v("s", ""),
+            "AttentionIconPixmap": lambda: v("a(iiay)", []),
+            "AttentionMovieName": lambda: v("s", ""),
+            "ItemIsMenu": lambda: v("b", False),
+        }.get(name, lambda: None)()
+
+    def on_sni_call(self, conn, sender, path, iface, method, params, inv):
+        dbg("вызов", method, "от", sender)
+        if method == "Activate":
+            self.focus_restore()
+            self.left_click()
+        elif method == "SecondaryActivate":
+            self.focus_restore()
+            self.do(self.cfg["middle_click"])
+        elif method == "ContextMenu" and self.cfg["menu_ui"] != "panel":
+            self.show_menu()
+        inv.return_value(None)
+
+    # ---- меню dbusmenu ----
+    def build_menu_items(self):
+        items = []
+        for i, it in enumerate(self.cfg["menu"], start=1):
+            if it.get("separator"):
+                props = {"type": GLib.Variant("s", "separator")}
+            else:
+                props = {"label": GLib.Variant("s", it.get("label", "?").replace("_", "__")),
+                         "enabled": GLib.Variant("b", bool(it.get("enabled", True))),
+                         "visible": GLib.Variant("b", True)}
+            items.append((i, props, it.get("command", "")))
+        return items
+
+    def on_menu_get(self, conn, sender, path, iface, name):
+        return {"Version": GLib.Variant("u", 3), "TextDirection": GLib.Variant("s", "ltr"),
+                "Status": GLib.Variant("s", "normal"), "IconThemePath": GLib.Variant("as", [])}.get(name)
+
+    def on_menu_call(self, conn, sender, path, iface, method, params, inv):
+        dbg("меню: вызов", method, "от", sender)
+        v = GLib.Variant
+        if method == "GetLayout":
+            parent = params.unpack()[0]
+            if parent == 0:
+                kids = [v("(ia{sv}av)", (i, p, [])) for i, p, _ in self.menu_items]
+                node = (0, {"children-display": v("s", "submenu")}, kids)
+            else:
+                node = (parent, {}, [])
+            inv.return_value(v("(u(ia{sv}av))", (1, node)))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0]
+            lst = [(i, p) for i, p, _ in self.menu_items if not ids or i in ids]
+            inv.return_value(v("(a(ia{sv}))", (lst,)))
+        elif method == "GetProperty":
+            i, name = params.unpack()
+            val = next((p[name] for k, p, _ in self.menu_items if k == i and name in p), v("s", ""))
+            inv.return_value(v("(v)", (val,)))
+        elif method == "Event":
+            i, ev = params.unpack()[:2]
+            self.menu_event(i, ev)
+            inv.return_value(None)
+        elif method == "EventGroup":
+            for i, ev, _data, _ts in params.unpack()[0]:
+                self.menu_event(i, ev)
+            inv.return_value(v("(ai)", ([],)))
+        elif method == "AboutToShow":
+            logf(f"меню: AboutToShow({params.unpack()[0]})")
+            self.menu_opened()
+            inv.return_value(v("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            logf("меню: AboutToShowGroup")
+            self.menu_opened()
+            inv.return_value(v("(aiai)", ([], [])))
+        else:
+            inv.return_error_literal(Gio.dbus_error_quark(), Gio.DBusError.UNKNOWN_METHOD, method)
+
+    def menu_event(self, item_id, ev):
+        if ev in ("opened", "closed", "clicked"):
+            logf(f"меню: событие {ev} (пункт {item_id})")
+        if ev == "opened" and item_id == 0:
+            self.menu_opened()
+        elif ev == "closed" and item_id == 0:
+            self.menu_closed()
+        elif ev == "clicked":
+            self.menu_click(item_id)
+
+    # Меню рисует панель (X11-окно под слоем overlay), а клавиатура лежит на слое overlay и закрыла бы его.
+    # Поэтому пока меню открыто, клавиатура временно прячется и возвращается, когда меню закрыто.
+    def menu_opened(self):
+        if getattr(self, "menu_open", False):
+            return
+        self.menu_open = True
+        self.kbd_hidden_by_menu = False
+        self.menu_timer = None
+        if self.cfg["menu_hide_keyboard"]:
+            self.read_osk()
+            if self.osk_shown:
+                self.kbd_hidden_by_menu = True
+                run_cmd(f"{self.cfg['osk']} hide")
+                self.osk_shown = False
+                self.announce()
+            # запасной выход: если панель не сообщит о закрытии меню, клавиатура всё равно вернётся
+            self.menu_timer = GLib.timeout_add_seconds(15, lambda: self.menu_closed(True))
+
+    def menu_closed(self, from_timer=False):
+        if not getattr(self, "menu_open", False):
+            return False
+        self.menu_open = False
+        if self.menu_timer and not from_timer:
+            GLib.source_remove(self.menu_timer)
+        self.menu_timer = None
+        if self.kbd_hidden_by_menu:
+            self.kbd_hidden_by_menu = False
+            run_cmd(f"{self.cfg['osk']} show")
+            GLib.timeout_add(500, self.refresh_once)
+        self.focus_restore(150)
+        return False
+
+    def menu_click(self, item_id):
+        for i, props, cmd in self.menu_items:
+            if i == item_id and cmd and props.get("enabled", GLib.Variant("b", True)).get_boolean():
+                restored = getattr(self, "kbd_hidden_by_menu", False)
+                self.menu_closed()                      # клавиатура возвращается до выполнения команды
+                if restored:
+                    GLib.timeout_add(450, lambda c=cmd: (self.do(c), False)[1])
+                else:
+                    self.do(cmd)
+
+    # ---- своё меню (fuzzel рисуется на слое overlay, поэтому лежит поверх экранной клавиатуры) ----
+    def show_menu(self):
+        if self.menu_busy:
+            return
+        entries = [(it["label"], it.get("command", "")) for it in self.cfg["menu"]
+                   if not it.get("separator") and it.get("enabled", True) and it.get("label")]
+        if not entries or not shutil.which("fuzzel"):
+            notify("Для меню нужен fuzzel (sudo apt install fuzzel) или menu_ui = \"panel\" в osk.toml")
+            return
+        c = self.cfg
+        cmd = ["fuzzel", "--dmenu", "--prompt", "", "--lines", str(len(entries)), "--width", str(c["menu_width_chars"]),
+               "--anchor", c["menu_anchor"], "--x-margin", str(c["menu_x_margin"]),
+               "--y-margin", str(c["menu_y_margin"])]
+        self.menu_busy = True
+        dbg("меню:", " ".join(cmd))
+
+        def worker():
+            try:
+                r = subprocess.run(cmd, input="\n".join(l for l, _ in entries) + "\n",
+                                   capture_output=True, text=True)
+                out = r.stdout.rstrip("\n") if r.returncode == 0 else ""
+                if r.returncode not in (0, 1):
+                    dbg("fuzzel завершился с кодом", r.returncode, r.stderr.strip())
+            except OSError as e:
+                out = ""
+                dbg("fuzzel не запустился:", e)
+            GLib.idle_add(self.menu_done, out, entries)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def menu_done(self, out, entries):
+        self.menu_busy = False
+        for label, command in entries:
+            if label == out:
+                self.do(command)
+                break
+        return False
+
+
+class LayerTray(Core):
+    """Значок - окно на слое overlay без клавиатурного фокуса (gtk-layer-shell)."""
+
+    def __init__(self, cfg, loop):
+        super().__init__(cfg, loop)
+        self.size = int(cfg["icon_size"])
+        self.pix = {}
+        self.menu_wins = []
+        self.place_win = None
+        self.install_css()
+        w, h = self.screen_size()
+        self.x, self.y = self.load_pos(w, h)
+        self.save_state()
+        self.win = None
+        self.build_icon_window()
+        # Значок должен переживать смену экрана (Moonlight, HDMI, переподключение монитора): окно на слое
+        # закрывается композитором вместе с выходом, поэтому следим за ним и создаём заново.
+        GLib.timeout_add(2000, self.watchdog)
+        try:
+            disp = Gdk.Display.get_default()
+            disp.connect("monitor-added", self.on_monitors)
+            disp.connect("monitor-removed", self.on_monitors)
+        except Exception:
+            pass
+
+    def build_icon_window(self):
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+        self.dead = False
+        self.win = self.make_window(self.size, self.size, top=self.eff_y(), left=self.x)
+        self.win.connect("destroy", self.on_win_destroy)
+        self.eb = Gtk.EventBox()
+        self.eb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                           | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.eb.connect("button-press-event", self.on_press)
+        self.eb.connect("button-release-event", self.on_release)
+        self.eb.connect("motion-notify-event", self.on_motion)
+        self.img = Gtk.Image()
+        self.eb.add(self.img)
+        self.win.add(self.eb)
+        self.update_icon()
+        self.win.show_all()
+
+    def on_win_destroy(self, _w):
+        self.dead = True
+
+    def on_monitors(self, *_):
+        dbg("экраны изменились, пересоздаю значок")
+        GLib.timeout_add(800, self.rebuild_icon)
+
+    def rebuild_icon(self):
+        w, h = self.screen_size()
+        self.x = max(0, min(self.x, w - self.size))
+        self.y = max(0, min(self.y, h - self.size))
+        self.build_icon_window()
+        return False
+
+    def watchdog(self):
+        if self.dead or not self.win.get_mapped():
+            dbg("окно значка пропало, создаю заново")
+            self.rebuild_icon()
+        return True
+
+    # ---- окна ----
+    def screen_size(self):
+        try:
+            d = Gdk.Display.get_default()
+            m = d.get_primary_monitor() or d.get_monitor(0)
+            g = m.get_geometry()
+            return g.width, g.height
+        except Exception:                               # экранов сейчас нет (переключение)
+            return 1920, 1080
+
+    def eff_y(self):
+        return self.y
+
+    def panel_h(self):
+        """Высота панели внизу экрана (px): из настроек, иначе из xfconf (/panels/panel-1/size), иначе 40."""
+        if int(self.cfg["panel_height"]) > 0:
+            return int(self.cfg["panel_height"])
+        if getattr(self, "_ph", None) is None:
+            self._ph = 40
+            try:
+                r = subprocess.run(["xfconf-query", "-c", "xfce4-panel", "-p", "/panels/panel-1/size"],
+                                   capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and r.stdout.strip().isdigit():
+                    self._ph = int(r.stdout.strip()) + 4
+            except (OSError, subprocess.SubprocessError):
+                pass
+            dbg("высота панели:", self._ph)
+        return self._ph
+
+    def kbd_top(self):
+        """Верхняя граница экранной клавиатуры (она стоит над панелью), None если клавиатуры на экране нет."""
+        if not self.osk_shown:
+            return None
+        _w, h = self.screen_size()
+        return h - self.panel_h() - int(self.cfg["kbd_h"])
+
+    def apply_position(self):
+        E = GtkLayerShell.Edge
+        GtkLayerShell.set_margin(self.win, E.TOP, int(self.eff_y()))
+        GtkLayerShell.set_margin(self.win, E.LEFT, int(self.x))
+        self.win.queue_resize()
+
+    def make_window(self, w, h, top=None, left=None, full=False, layer=None):
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_decorated(False)
+        win.set_app_paintable(True)
+        win.set_title("osk-tray")
+        vis = win.get_screen().get_rgba_visual()
+        if vis:
+            win.set_visual(vis)
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, "osk-tray")
+        GtkLayerShell.set_layer(win, layer or GtkLayerShell.Layer.OVERLAY)
+        if hasattr(GtkLayerShell, "set_keyboard_mode"):
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.NONE)   # главное: фокус не берём
+        else:
+            GtkLayerShell.set_keyboard_interactivity(win, False)
+        GtkLayerShell.set_exclusive_zone(win, -1)               # не двигать и не сдвигаться от других окон
+        E = GtkLayerShell.Edge
+        if full:
+            for e in (E.TOP, E.BOTTOM, E.LEFT, E.RIGHT):
+                GtkLayerShell.set_anchor(win, e, True)
+        else:
+            win.set_default_size(w, h)
+            win.set_size_request(w, h)
+            win.set_resizable(False)
+            GtkLayerShell.set_anchor(win, E.TOP, True)
+            GtkLayerShell.set_anchor(win, E.LEFT, True)
+            GtkLayerShell.set_margin(win, E.TOP, int(top))
+            GtkLayerShell.set_margin(win, E.LEFT, int(left))
+        return win
+
+    def install_css(self):
+        c = self.cfg
+        css = f"""
+        window {{ background: transparent; }}
+        .osk-menu {{ background: #{c['menu_bg']}; border-radius: 8px; border: 1px solid #555; padding: 4px; }}
+        .osk-menu button {{ background: transparent; border: none; border-radius: 6px; color: #{c['menu_fg']};
+                           padding: 7px 12px; box-shadow: none; text-shadow: none; }}
+        .osk-menu button:hover {{ background: #{c['menu_hover']}; }}
+        .osk-menu button:disabled {{ color: #808080; }}
+        .osk-menu separator {{ background: #555; min-height: 1px; margin: 4px 6px; }}
+        .osk-catch {{ background: rgba(0,0,0,0.01); }}
+        .osk-place {{ background: rgba(0,0,0,0.35); }}
+        .osk-hint {{ background: #{c['menu_bg']}; color: #{c['menu_fg']}; border-radius: 10px; padding: 14px 22px;
+                    font-size: 15px; }}
+        """
+        prov = Gtk.CssProvider()
+        prov.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ---- положение ----
+    def load_pos(self, w, h):
+        try:
+            d = json.loads(STATE.read_text())
+            x, y = int(d["x"]), int(d["y"])
+        except (OSError, ValueError, KeyError, TypeError):
+            x, y = int(self.cfg["icon_x"]), int(self.cfg["icon_y"])
+        if x < 0 or y < 0:
+            x = w - int(self.cfg["icon_margin_right"]) - self.size      # по умолчанию - правый верхний угол
+            y = int(self.cfg["icon_margin_top"])
+        return max(0, min(x, w - self.size)), max(0, min(y, h - self.size))
+
+    def save_state(self):
+        try:
+            STATE.parent.mkdir(parents=True, exist_ok=True)
+            STATE.write_text(json.dumps({"x": self.x, "y": self.y, "panel_h": self.panel_h()}))
+        except OSError as e:
+            dbg("не удалось сохранить положение:", e)
+
+    def move_icon(self, x, y):
+        w, h = self.screen_size()
+        self.x, self.y = max(0, min(int(x), w - self.size)), max(0, min(int(y), h - self.size))
+        self.apply_position()
+        self.save_state()
+
+    # ---- значок ----
+    def pixbuf(self):
+        f = self.icon_file()
+        key = (str(f), self.layout, self.osk_shown, self.size)
+        if key not in self.pix:
+            pb = None
+            try:
+                if f.is_file():
+                    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(f), self.size, self.size, True)
+                else:
+                    bg = self.cfg["colors"].get(self.layout, self.cfg["default_color"])
+                    ld = GdkPixbuf.PixbufLoader.new_with_type("svg")
+                    ld.set_size(self.size, self.size)
+                    ld.write(svg_tile(self.layout, bg, self.osk_shown).encode())
+                    ld.close()
+                    pb = ld.get_pixbuf()
+            except Exception as e:
+                print("osk-tray: не удалось подготовить значок:", e, file=sys.stderr)
+            self.pix[key] = pb
+        return self.pix[key]
+
+    def update_icon(self):
+        pb = self.pixbuf()
+        if pb is not None:
+            self.img.set_from_pixbuf(pb)
+        else:
+            self.img.set_from_icon_name("input-keyboard", Gtk.IconSize.LARGE_TOOLBAR)
+        self.eb.set_tooltip_text(self.tooltip_text())
+
+    _was_shown = False
+
+    def changed(self):
+        self.update_icon()
+        self.apply_position()
+        if self.osk_shown and not self._was_shown:       # клавиатура показана позже значка и легла бы поверх него:
+            GLib.timeout_add(350, self.raise_icon)       # пересоздаём окно значка, новое окно слоя ложится выше
+        self._was_shown = self.osk_shown
+
+    def raise_icon(self):
+        dbg("поднимаю значок над клавиатурой")
+        if not self.dead and self.drag is None:
+            self.build_icon_window()
+        return False
+
+    def on_press(self, widget, ev):
+        dbg("клик по значку: кнопка", ev.button, "тип", ev.type.value_nick)
+        if ev.type != Gdk.EventType.BUTTON_PRESS:        # двойные/тройные события GTK пропускаем: считаем сами
+            return True
+        if ev.button == 1:
+            self.drag = (ev.x, ev.y, False)               # клик засчитаем при отпускании, если значок не тащили
+        elif ev.button == 2:
+            self.do(self.cfg["middle_click"])
+        elif ev.button == 3:
+            self.show_menu()
+        return True
+
+    drag = None
+
+    ghost = None
+
+    def on_motion(self, widget, ev):
+        """Перетаскивание. Окно значка во время нажатия не двигаем (координаты мыши идут относительно него),
+        вместо этого едет «тень» - второе окно того же размера; настоящий значок встаёт на место при отпускании."""
+        if self.drag is None or not self.cfg["icon_drag"]:
+            return False
+        px, py, moved = self.drag
+        if not moved and abs(ev.x - px) + abs(ev.y - py) < 8:
+            return True
+        w, h = self.screen_size()
+        nx = max(0, min(int(self.x + ev.x - px), w - self.size))
+        ny = max(0, min(int(self.y + ev.y - py), h - self.size))
+        if not moved:
+            self.drag = (px, py, True)
+            self.close_menu()
+            self.ghost = self.make_window(self.size, self.size, top=ny, left=nx)
+            gi = Gtk.Image()
+            gi.set_from_pixbuf(self.pixbuf())
+            self.ghost.add(gi)
+            self.ghost.show_all()
+        self.ghost_pos = (nx, ny)
+        E = GtkLayerShell.Edge
+        GtkLayerShell.set_margin(self.ghost, E.TOP, ny)
+        GtkLayerShell.set_margin(self.ghost, E.LEFT, nx)
+        self.ghost.queue_resize()
+        return True
+
+    def on_release(self, widget, ev):
+        if ev.button != 1 or self.drag is None:
+            return True
+        moved = self.drag[2]
+        self.drag = None
+        if moved:
+            if self.ghost is not None:
+                self.x, self.y = self.ghost_pos
+                self.ghost.destroy()
+                self.ghost = None
+            self.apply_position()
+            self.save_state()
+            dbg("значок перетащен:", self.x, self.y)
+        else:
+            self.left_click()
+        return True
+
+    # ---- меню ----
+    def close_menu(self):
+        for w in self.menu_wins:
+            w.destroy()
+        self.menu_wins = []
+
+    def catcher(self, css_class, on_press, layer=None):
+        c = self.make_window(0, 0, full=True, layer=layer)
+        c.get_style_context().add_class(css_class)
+        # реагируем на отпускание кнопки: окно, уничтоженное посреди нажатия, оставляет композитор с «зависшим» захватом
+        c.add_events(Gdk.EventMask.BUTTON_RELEASE_MASK)
+        c.connect("button-release-event", on_press)
+        return c
+
+    def show_menu(self):
+        if self.menu_wins:                               # меню уже открыто - закрываем
+            self.close_menu()
+            return
+        # Невидимое окно на весь экран ловит клик мимо меню и закрывает его (клавиатурный фокус никому не нужен).
+        catch = self.catcher("osk-catch", self.catch_pressed, GtkLayerShell.Layer.TOP)   # ниже меню (overlay)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.get_style_context().add_class("osk-menu")
+        for it in self.cfg["menu"]:
+            if it.get("separator"):
+                box.pack_start(Gtk.Separator(), False, False, 0)
+                continue
+            b = Gtk.Button(label=it.get("label", "?"))
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.get_child().set_xalign(0)
+            b.set_sensitive(bool(it.get("enabled", True)))
+            b.set_focus_on_click(False)
+            b.connect("clicked", self.menu_item, it.get("command", ""))
+            box.pack_start(b, False, False, 0)
+        mw = int(self.cfg["menu_width"])
+        win = self.make_window(mw, 10, top=0, left=0)
+        win.add(box)
+        win.set_size_request(mw, -1)
+        box.show_all()
+        mh = box.get_preferred_height()[1]
+        sw, sh = self.screen_size()
+        iy = self.eff_y()
+        gap = int(self.cfg["menu_gap"])
+        left = max(4, min(self.x + self.size - mw, sw - mw - 4))
+        kt = self.kbd_top()
+        if kt is not None and iy + self.size > kt:          # значок под клавиатурой: меню выше её верхней кромки
+            top = kt - mh - gap
+        else:
+            top = iy - mh - gap if iy + self.size / 2 > sh / 2 else iy + self.size + gap
+        top = max(4, min(top, sh - mh - 4))
+        E = GtkLayerShell.Edge
+        GtkLayerShell.set_margin(win, E.TOP, int(top))
+        GtkLayerShell.set_margin(win, E.LEFT, int(left))
+        self.menu_wins = [catch, win]
+        catch.show_all()                                 # сначала ловушка; меню показываем чуть позже, чтобы оно легло выше
+
+        def show_win():
+            if win in self.menu_wins:
+                win.show_all()
+            return False
+
+        GLib.timeout_add(80, show_win)
+
+    def catch_pressed(self, widget, ev):
+        dbg("меню: клик мимо, закрываю")
+        self.close_menu()
+        return True
+
+    def menu_item(self, button, command):
+        dbg("меню: пункт", command)
+        self.close_menu()
+        GLib.idle_add(lambda: self.do(command) or False)
+
+    # ---- перемещение значка: клик в нужном месте экрана ----
+    def place(self):
+        if self.place_win:
+            return
+        self.close_menu()
+
+        def pressed(widget, ev):
+            if ev.button == 1:
+                self.move_icon(ev.x - self.size / 2, ev.y - self.size / 2)    # окно-ловушка занимает весь экран с (0, 0)
+            self.place_win.destroy()
+            self.place_win = None
+            return True
+
+        win = self.catcher("osk-place", pressed)
+        hint = Gtk.Label(label="Кликните там, куда поставить значок.\nПравая кнопка - отмена.")
+        hint.get_style_context().add_class("osk-hint")
+        hint.set_justify(Gtk.Justification.CENTER)
+        hint.set_halign(Gtk.Align.CENTER)
+        hint.set_valign(Gtk.Align.CENTER)
+        win.add(hint)
+        self.place_win = win
+        win.show_all()
+        gw = win.get_window()
+        if gw:
+            gw.set_cursor(Gdk.Cursor.new_from_name(Gdk.Display.get_default(), "crosshair"))
+
+
+
+def autoenv():
+    """По SSH нет переменных сеанса: подставляем их сами (сокет Wayland, шина D-Bus)."""
+    os.environ.setdefault("XDG_RUNTIME_DIR", str(RUN))
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        socks = sorted(p.name for p in RUN.glob("wayland-*") if not p.name.endswith(".lock"))
+        if socks:
+            os.environ["WAYLAND_DISPLAY"] = socks[0]
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") and (RUN / "bus").exists():
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={RUN}/bus"
+
+
+PIDF = RUN / "osk-tray.pid"
+
+
+def running_pid():
+    try:
+        pid = int(PIDF.read_text())
+        if b"osk-tray" in Path(f"/proc/{pid}/cmdline").read_bytes():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def cmd_stop():
+    pid = running_pid()
+    if not pid:
+        print("osk-tray не запущен")
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        time.sleep(0.1)
+        if running_pid() is None:
+            break
+    print("osk-tray остановлен")
+
+
+def cmd_start():
+    pid = running_pid()
+    if pid:
+        print(f"osk-tray уже работает (pid {pid})")
+        return
+    out = HOME / ".cache/osk/tray.out"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "a") as f:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__)], stdout=f, stderr=f,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(30):
+        time.sleep(0.1)
+        if running_pid():
+            break
+    pid = running_pid()
+    print(f"osk-tray запущен (pid {pid})" if pid else f"osk-tray не запустился, смотри {out}")
+    try:
+        print(out.read_text().strip().splitlines()[-1])
+    except (OSError, IndexError):
+        pass
+
+
+def client(argv):
+    """`osk-tray layout en|ru|toggle`, `osk-tray place`, `osk-tray menu` - команда уже работающему значку."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.sendto(" ".join(argv).encode(), str(SOCK))
+    except OSError:
+        sys.exit("osk-tray не запущен")
+
+
+def main():
+    autoenv()
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ("hide", "show", "toggle"):      # явное управление экранной клавиатурой (значок не нужен)
+            osk = Path(__file__).resolve().parent / "osk"
+            sys.exit(subprocess.call([sys.executable, str(osk), sys.argv[1]]))
+        if sys.argv[1] == "dblclick":                      # osk-tray dblclick 800: подобрать время двойного клика
+            if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+                print("сейчас:", load_cfg()["double_click_ms"], "мс. Задать: osk-tray dblclick 800")
+                return
+            path = os.path.realpath(CONF)
+            txt = Path(path).read_text() if os.path.exists(path) else ""
+            if re.search(r"(?m)^double_click_ms\s*=", txt):
+                txt = re.sub(r"(?m)^double_click_ms\s*=.*$", "double_click_ms = " + sys.argv[2], txt)
+            else:
+                txt = re.sub(r"(?m)^\[tray\]\s*$", "[tray]\ndouble_click_ms = " + sys.argv[2], txt, count=1)
+            Path(path).write_text(txt)
+            print("double_click_ms =", sys.argv[2], "(пауза до смены раскладки при одиночном клике); перезапускаю значок")
+            cmd_stop()
+            return cmd_start()
+        if sys.argv[1] in ("layout", "place", "menu", "quit", "refocus"):
+            client(sys.argv[1:])
+            return
+        if sys.argv[1] == "start":
+            return cmd_start()
+        if sys.argv[1] == "stop":
+            return cmd_stop()
+        if sys.argv[1] == "restart":
+            cmd_stop()
+            return cmd_start()
+        if sys.argv[1] == "status":
+            pid = running_pid()
+            print(f"osk-tray работает (pid {pid})" if pid else "osk-tray не запущен")
+            try:
+                print("журнал:", (HOME / ".cache/osk/tray.log").read_text().strip().splitlines()[-1])
+            except (OSError, IndexError):
+                pass
+            return
+        if sys.argv[1] == "diag":
+            ok = import_gtk()
+            print("режим layer:", "доступен" if ok else "НЕДОСТУПЕН - " + GTK_WHY)
+            print("WAYLAND_DISPLAY =", os.environ.get("WAYLAND_DISPLAY"), "| XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
+            print("значок уже запущен:", "да" if SOCK.exists() else "нет (нет сокета)")
+            return
+        sys.exit(__doc__)
+    lock = open(RUN / "osk-tray.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("osk-tray уже запущен")
+    PIDF.write_text(str(os.getpid()))
+    cfg = load_cfg()
+    mode = cfg["mode"]
+    use_layer = False
+    if mode in ("auto", "layer"):
+        use_layer = import_gtk()
+        if not use_layer and mode == "layer":
+            notify("Режим layer недоступен: нужен пакет gir1.2-gtklayershell-0.1 и композитор с layer-shell. "
+                   "Включён запасной режим (значок в панели).")
+    why = "" if use_layer else (GTK_WHY or "mode = sni в osk.toml")
+    if mode == "auto" and not use_layer and GTK_WHY:
+        notify("Значок работает в режиме панели (sni): " + GTK_WHY)
+    try:                                    # одна строка в журнал: какой режим включился и почему
+        log = HOME / ".cache/osk/tray.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a") as f:
+            f.write(time.strftime("%F %T") + " режим: " + ("layer" if use_layer else "sni (" + why + ")") + "\n")
+    except OSError:
+        pass
+    print("osk-tray: режим", "layer" if use_layer else "sni (" + why + ")", file=sys.stderr, flush=True)
+    loop = GLib.MainLoop()
+    dbg("режим:", "layer" if use_layer else "sni")
+    (LayerTray if use_layer else SniTray)(cfg, loop)
+    for sig in (2, 15):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    loop.run()
+    for f in (SOCK, PIDF):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

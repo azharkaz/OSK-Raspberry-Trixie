@@ -1,0 +1,135 @@
+# Общий конфиг экранной клавиатуры и буфера обмена.
+# Читают: osk (клавиатура) и clipd (буфер). Применить изменения клавиатуры: osk restart
+# Лежит в папке проекта, в ~/.config/osk/osk.toml стоит ссылка на него (install.sh).
+
+[keyboard]
+# binary = "~/wvkbd/wvkbd-wide"   # по умолчанию ищется в PATH и в source_dir
+source_dir = "~/wvkbd"
+height = 300             # высота в портретной ориентации, px
+landscape_height = 300   # высота в ландшафте (экран 1920x1080), px
+font = "Sans 12"
+alpha = 235              # прозрачность: 0 (прозрачная) .. 255 (непрозрачная)
+rounding = 6             # скругление клавиш
+layers = ["wideen", "wideru"]
+landscape_layers = ["wideen", "wideru"]
+start_hidden = false
+non_exclusive = true     # true: клавиатура лежит поверх панели и окон, ничего не сдвигая
+
+# Цвета в формате rrggbb или rrggbbaa. Что не задано - берётся из сборки.
+[colors]
+# bg = "0f0f0f"        # фон клавиатуры
+# fg = "2d2d2d"        # обычные клавиши
+# fg_sp = "202020"     # служебные клавиши
+# press = "646464"     # нажатая клавиша
+# press_sp = "646464"
+# text = "ffffff"
+# text_sp = "ffffff"
+
+[clipboard]
+device = "raspi"                 # имя этого устройства в файлах claude_bufer
+sync_dir = "~/Syncthing/Zametki_ALL/claude_bufer"
+max_entries = 500                # сколько записей хранить в clip_hist-<device>.txt
+max_bytes = 100000               # клипы больше этого размера не сохраняем
+primary = false                  # писать ли выделение мышью (PRIMARY)
+paste_delay_ms = 350             # пауза перед вставкой после закрытия окна
+paste_mods = ["ctrl"]            # для терминала: ["ctrl", "shift"]
+
+# --- окно истории (clipd pick) ---
+ui = "gtk"                       # gtk - окно с вкладками | fuzzel - простой список
+include = ["*.txt"]              # какие файлы из sync_dir показывать вкладками (маски)
+exclude = []                     # какие файлы скрыть, например ["to_redmi.txt", "pc.txt"]
+tab_order = []                   # порядок вкладок (имена файлов), остальные идут после
+show_empty_tabs = false
+rows_per_tab = 200
+row_lines = 4                    # сколько строк многострочной записи показывать в списке
+refresh_ms = 1000                # как часто окно истории проверяет новые записи, мс
+window_width = 700
+window_height = 540
+close_on_focus_out = true        # только для обычного окна; поверх клавиатуры (режим overlay) окно закрывается крестиком, Esc или выбором записи
+
+# свои названия вкладок (по имени файла), необязательно
+[clipboard.tab_labels]
+# "clip_hist-raspi.txt" = "История Pi"
+
+# --- запасное меню (ui = "fuzzel") ---
+# menu = "fuzzel"                # fuzzel | wofi
+# menu_limit = 300
+# close_item = "top"             # top | bottom | off
+
+# --- значок раскладки (osk-tray) ---
+[tray]
+# layer - (по умолчанию) плавающий значок поверх всех окон, перетаскивается мышью; меню и окно истории
+#         рисуются над клавиатурой, клавиатура НЕ прячется
+# sni   - запасной вариант: значок в области уведомлений панели (меню рисует панель,
+#         на время меню клавиатура прячется)
+mode = "layer"
+menu_ui = "panel"                                # меню значка рисует панель
+menu_hide_keyboard = true                        # только для mode = "sni": пока открыто меню, клавиатура прячется
+restore_focus = true                             # после клика по значку вернуть фокус прежнему окну
+panel_ids = ["panel"]                            # часть app_id окон панели (они не считаются рабочими окнами)
+# --- только для mode = "layer" ---
+panel_height = 0                                 # высота панели внизу, px (0 = узнать из xfconf, иначе 40)
+menu_gap = 6                                     # зазор между меню и значком / верхом клавиатуры
+poll_ms = 150
+icon_size = 28
+icon_x = -1                                      # -1 = автоматически
+icon_y = -1
+icon_margin_right = 12                           # положение по умолчанию: правый верхний угол (потом значок просто перетаскивают)
+icon_margin_top = 12
+icon_drag = true                                 # значок можно перетащить левой кнопкой, положение запоминается
+menu_width = 300
+menu_bg = "262626"
+menu_fg = "f0f0f0"
+menu_hover = "3d6fd8"
+# --- общее ---
+layout_state_file = ""
+sync_layer = true                                # слой экранной клавиатуры меняется вслед за языком системы
+left_click = "layout"                            # layout = сменить язык (физическая клавиатура) или своя команда
+double_click = "~/.local/bin/osk toggle"          # пусто ("") - отключить, тогда левый клик срабатывает сразу
+middle_click = "~/.local/bin/clipd pick --paste --toggle"   # средний клик: показать/скрыть окно истории; можно любая команда
+double_click_ms = 1200                           # окно двойного клика, мс; одиночный клик (смена языка) срабатывает с такой задержкой. Подбор: osk-tray dblclick 800
+# Картинки значка: папка ICONs/tray рядом с osk-tray (пусто = так и есть). {layout} -> en / ru
+icons_dir = ""
+icon_hidden = "flag-{layout}.png"                # клавиатура скрыта: флаг
+icon_shown = "kbd-{layout}.png"                  # клавиатура показана: клавиатура с флагом
+toggle_keys = ["KEY_LEFTALT", "KEY_LEFTSHIFT"]   # комбинация смены раскладки в системе (grp:alt_shift_toggle)
+
+[tray.colors]                                    # цвет запасной плитки значка (если нет картинок), rrggbb
+EN = "1e5fd8"
+RU = "c8372d"
+
+# Пункты правого клика (порядок сверху вниз). command = "quit" закрывает значок.
+[[tray.menu]]
+label = "Открыть историю буфера обмена"
+command = "~/.local/bin/clipd pick --paste --toggle"
+
+[[tray.menu]]
+label = "Показать / скрыть клавиатуру"
+command = "~/.local/bin/osk toggle"
+
+[[tray.menu]]
+label = "Открепить клавиатуру (скоро)"
+command = "~/.local/bin/osk float"
+enabled = false
+
+[[tray.menu]]
+separator = true
+
+[[tray.menu]]
+label = "Переместить значок"
+command = "place"
+
+[[tray.menu]]
+label = "Настройки (osk.toml)"
+command = "mousepad ~/.config/osk/osk.toml"
+
+[[tray.menu]]
+label = "Перезапустить клавиатуру"
+command = "~/.local/bin/osk restart"
+
+[[tray.menu]]
+separator = true
+
+[[tray.menu]]
+label = "Выход"
+command = "quit"
