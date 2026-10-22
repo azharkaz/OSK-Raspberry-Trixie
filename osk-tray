@@ -26,6 +26,7 @@
 Управление из терминала (в том числе по SSH, переменные Wayland подбираются сами):
   osk-tray start | stop | restart | status    запуск в фоне / остановка / перезапуск / состояние
   osk-tray dblclick [мс]                       показать / задать время двойного клика
+  osk-tray (сторож)                            значок запускается под присмотром: упал - поднимется сам; `stop` останавливает всё
   osk-tray hide | show | toggle                явно скрыть / показать / переключить экранную клавиатуру
   osk-tray layout en|ru|toggle | place | menu  команда работающему значку
   osk-tray diag                                что доступно (layer-shell, Wayland) и запущен ли значок
@@ -123,7 +124,9 @@ DEFAULTS = {
     "icon_y": -1,
     "icon_margin_right": 12,
     "icon_margin_top": 12,
-    "icon_drag": True,           # для автоматического положения: отступ от правого края (оставьте место под часы/трей)
+    "icon_drag": True,
+    "icon_refresh_s": 20,               # раз в столько секунд значок тихо пересоздаётся (0 - не надо): страховка, если он стал невидимым
+    "watchdog": True,                   # сторож: перезапускать значок, если он упал, и клавиатуру, если она пропала сама           # для автоматического положения: отступ от правого края (оставьте место под часы/трей)
     "panel_height": 0,                  # высота панели, px; 0 = определить по положению значка (панель снизу ~ 2*отступ значка от низа)
     "menu_gap": 6,                      # зазор между меню и клавиатурой/значком
     "menu_bg": "262626",                # цвета меню (rrggbb)
@@ -1096,6 +1099,8 @@ class LayerTray(Core):
         # Значок должен переживать смену экрана (Moonlight, HDMI, переподключение монитора): окно на слое
         # закрывается композитором вместе с выходом, поэтому следим за ним и создаём заново.
         GLib.timeout_add(2000, self.watchdog)
+        if int(self.cfg["icon_refresh_s"]) > 0:
+            GLib.timeout_add_seconds(int(self.cfg["icon_refresh_s"]), self.periodic)
         try:
             disp = Gdk.Display.get_default()
             disp.connect("monitor-added", self.on_monitors)
@@ -1103,15 +1108,25 @@ class LayerTray(Core):
         except Exception:
             pass
 
-    def build_icon_window(self):
-        if self.win is not None:
+    win_hid = None
+
+    def build_icon_window(self, soft=False):
+        """Создать окно значка. soft=True: сначала новое, потом убрать старое (мигания нет, новое ложится выше)."""
+        old = self.win
+        if old is not None:
             try:
-                self.win.destroy()
+                if self.win_hid is not None:
+                    old.disconnect(self.win_hid)
             except Exception:
                 pass
+            if not soft:
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
         self.dead = False
         self.win = self.make_window(self.size, self.size, top=self.eff_y(), left=self.x)
-        self.win.connect("destroy", self.on_win_destroy)
+        self.win_hid = self.win.connect("destroy", self.on_win_destroy)
         self.eb = Gtk.EventBox()
         self.eb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
                            | Gdk.EventMask.POINTER_MOTION_MASK)
@@ -1123,6 +1138,20 @@ class LayerTray(Core):
         self.win.add(self.eb)
         self.update_icon()
         self.win.show_all()
+        if soft and old is not None:
+            def kill_old():
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
+                return False
+            GLib.timeout_add(300, kill_old)
+
+    def periodic(self):
+        """Страховка: раз в N секунд пересоздаём окно значка (когда нет перетаскивания и меню)."""
+        if not self.dead and self.drag is None and not self.menu_wins and not self.place_win and self.ghost is None:
+            self.build_icon_window(soft=True)
+        return True
 
     def on_win_destroy(self, _w):
         self.dead = True
@@ -1302,7 +1331,7 @@ class LayerTray(Core):
     def raise_icon(self):
         dbg("поднимаю значок над клавиатурой")
         if not self.dead and self.drag is None:
-            self.build_icon_window()
+            self.build_icon_window(soft=True)
         return False
 
     def on_press(self, widget, ev):
@@ -1488,10 +1517,116 @@ def running_pid():
     return None
 
 
+SUPF = RUN / "osk-tray-sup.pid"
+
+
+def sup_pid():
+    try:
+        pid = int(SUPF.read_text())
+        if b"osk-tray" in Path(f"/proc/{pid}/cmdline").read_bytes():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def kbd_check(dead):
+    """Экранная клавиатура пропала САМА (упала)? Файл состояния говорит shown/hidden, а процесса нет.
+    Если клавиатуру остановили командой `osk stop`, там записано stopped - тогда ничего не делаем.
+    Нужны две проверки подряд (ловим не момент перезапуска `osk restart`). -> нужна ли команда запуска, какая."""
+    try:
+        st = (RUN / "osk.state").read_text().strip()
+        pid = int((RUN / "osk.pid").read_text())
+    except (OSError, ValueError):
+        dead[0] = 0
+        return None
+    try:
+        alive = b"wvkbd" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        alive = False
+    if alive or st not in ("shown", "hidden"):
+        dead[0] = 0
+        return None
+    dead[0] += 1
+    return st if dead[0] >= 2 else None
+
+
+def run_supervisor():
+    """Сторож: держит значок живым. Упал (убит системой при нехватке памяти и т.п.) - запускает заново.
+    Клавиатуру возвращает только если она пропала сама, и в том же состоянии (свёрнутая/показанная)."""
+    SUPF.write_text(str(os.getpid()))
+    stopping = [False]
+    child = [None]
+
+    def term(*_):
+        stopping[0] = True
+        p = child[0]
+        if p is not None and p.poll() is None:
+            p.terminate()
+
+    signal.signal(signal.SIGTERM, term)
+    signal.signal(signal.SIGINT, term)
+    me = os.path.realpath(__file__)
+    osk = Path(me).parent / "osk"
+    starts, kfix, dead = [], [], [0]
+    while not stopping[0]:
+        now = time.monotonic()
+        starts[:] = [x for x in starts if now - x < 300]
+        if len(starts) >= 8:
+            logf("сторож: значок падает слишком часто (8 раз за 5 минут), останавливаюсь")
+            break
+        starts.append(now)
+        p = subprocess.Popen([sys.executable, me], stdin=subprocess.DEVNULL)
+        child[0] = p
+        logf(f"сторож: значок запущен (pid {p.pid})")
+        while p.poll() is None and not stopping[0]:
+            time.sleep(2)
+            st = kbd_check(dead)
+            if st:
+                now = time.monotonic()
+                kfix[:] = [x for x in kfix if now - x < 600]
+                if len(kfix) < 3:
+                    kfix.append(now)
+                    dead[0] = 0
+                    logf(f"сторож: экранная клавиатура пропала (была: {st}), запускаю заново")
+                    args = ["start", "--hidden"] if st == "hidden" else ["show"]
+                    try:
+                        subprocess.run([sys.executable, str(osk)] + args, timeout=30,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+        if stopping[0]:
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            break
+        rc = p.returncode
+        if rc in (0, -15):
+            logf("сторож: значок закрыт штатно, сторож завершается")
+            break
+        logf(f"сторож: значок завершился неожиданно (код {rc}), запускаю заново")
+        time.sleep(2)
+    try:
+        SUPF.unlink()
+    except OSError:
+        pass
+
+
 def cmd_stop():
+    sp = sup_pid()
+    if sp:                                              # сначала сторожа, иначе он перезапустит значок
+        try:
+            os.kill(sp, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(60):
+            time.sleep(0.1)
+            if sup_pid() is None and running_pid() is None:
+                break
     pid = running_pid()
     if not pid:
-        print("osk-tray не запущен")
+        print("osk-tray остановлен" if sp else "osk-tray не запущен")
         return
     os.kill(pid, signal.SIGTERM)
     for _ in range(30):
@@ -1506,11 +1641,15 @@ def cmd_start():
     if pid:
         print(f"osk-tray уже работает (pid {pid})")
         return
+    if sup_pid():
+        print("сторож уже запущен, значок сейчас поднимется")
+        return
+    watch = bool(load_cfg()["watchdog"])
     out = HOME / ".cache/osk/tray.out"
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "a") as f:
-        subprocess.Popen([sys.executable, os.path.realpath(__file__)], stdout=f, stderr=f,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([sys.executable, os.path.realpath(__file__)] + (["supervise"] if watch else []),
+                         stdout=f, stderr=f, stdin=subprocess.DEVNULL, start_new_session=True)
     for _ in range(30):
         time.sleep(0.1)
         if running_pid():
@@ -1555,6 +1694,8 @@ def main():
         if sys.argv[1] in ("layout", "place", "menu", "quit", "refocus"):
             client(sys.argv[1:])
             return
+        if sys.argv[1] == "supervise":                     # внутренняя команда: сторож (её запускает `start`)
+            return run_supervisor()
         if sys.argv[1] == "start":
             return cmd_start()
         if sys.argv[1] == "stop":
@@ -1565,6 +1706,8 @@ def main():
         if sys.argv[1] == "status":
             pid = running_pid()
             print(f"osk-tray работает (pid {pid})" if pid else "osk-tray не запущен")
+            sp = sup_pid()
+            print(f"сторож: работает (pid {sp})" if sp else "сторож: не запущен")
             try:
                 print("журнал:", (HOME / ".cache/osk/tray.log").read_text().strip().splitlines()[-1])
             except (OSError, IndexError):
@@ -1575,6 +1718,14 @@ def main():
             print("режим layer:", "доступен" if ok else "НЕДОСТУПЕН - " + GTK_WHY)
             print("WAYLAND_DISPLAY =", os.environ.get("WAYLAND_DISPLAY"), "| XDG_RUNTIME_DIR =", os.environ.get("XDG_RUNTIME_DIR"))
             print("значок уже запущен:", "да" if SOCK.exists() else "нет (нет сокета)")
+            pid = running_pid()
+            if pid:
+                try:
+                    rss = [l for l in Path(f"/proc/{pid}/status").read_text().splitlines() if l.startswith("VmRSS")]
+                    print("память значка:", rss[0].split(":", 1)[1].strip() if rss else "?")
+                except OSError:
+                    pass
+            print("сторож:", f"работает (pid {sup_pid()})" if sup_pid() else "не запущен")
             return
         sys.exit(__doc__)
     lock = open(RUN / "osk-tray.lock", "w")
