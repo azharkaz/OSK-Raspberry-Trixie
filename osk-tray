@@ -1293,7 +1293,11 @@ class LayerTray(Core):
     # ---- значок ----
     def pixbuf(self):
         f = self.icon_file()
-        key = (str(f), self.layout, self.osk_shown, self.size)
+        try:
+            mt = f.stat().st_mtime_ns          # заменили картинку - подхватится сама (в ключе кэша время изменения файла)
+        except OSError:
+            mt = 0
+        key = (str(f), mt, self.layout, self.osk_shown, self.size)
         if key not in self.pix:
             pb = None
             try:
