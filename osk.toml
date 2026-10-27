@@ -43,6 +43,15 @@ show_empty_tabs = false
 rows_per_tab = 200
 row_lines = 4                    # сколько строк многострочной записи показывать в списке
 refresh_ms = 1000                # как часто окно истории проверяет новые записи, мс
+
+# --- шаблоны (clipd tpl) ---
+templates_dir = ""                       # папка шаблонов; пусто = <sync_dir>/templates (т.е. .../claude_bufer/templates)
+templates_exts = ["txt", ""]             # какие файлы считаются шаблонами: расширения ("" = файлы без расширения, как в jbak2)
+templates_action = "paste"               # что делает выбор шаблона: paste (вставить в активное окно) | copy (только в буфер)
+templates_strip_newline = true           # убирать перевод строки в конце (иначе вставленная в терминал команда сразу выполнится)
+templates_export_dir = "~/Syncthing/jbak2/templates/trixie"   # куда копирует `clipd tpl-export` (создаётся, если нет)
+terminal_apps = ["foot", "xterm", "lxterminal", "qterminal", "xfce4-terminal", "alacritty", "kitty", "terminator", "konsole", "gnome-terminal", "tilix", "wezterm", "urxvt", "sakura", "terminology"]
+paste_mods_terminal = ["ctrl", "shift"]  # вставка в терминалы (окно узнаётся по app_id из списка выше); для остальных - paste_mods
 window_width = 700
 window_height = 540
 close_on_focus_out = true        # только для обычного окна; поверх клавиатуры (режим overlay) окно закрывается крестиком, Esc или выбором записи
@@ -104,6 +113,14 @@ RU = "c8372d"
 [[tray.menu]]
 label = "Открыть историю буфера обмена"
 command = "~/.local/bin/clipd pick --paste --toggle"
+
+[[tray.menu]]
+label = "Шаблоны..."
+command = "~/.local/bin/clipd tpl --toggle"
+
+[[tray.menu]]
+label = "Копировать шаблоны в jbak2"
+command = "~/.local/bin/clipd tpl-export"
 
 [[tray.menu]]
 label = "Показать / скрыть клавиатуру"

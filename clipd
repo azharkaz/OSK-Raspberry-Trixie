@@ -4,6 +4,8 @@
 
   clipd watch              демон: следит за буфером (запускать из autostart)
   clipd pick [--paste] [--toggle]  окно истории (--toggle: повторный вызов закрывает окно); меню: входящие, последние клипы и история всех устройств
+  clipd tpl [--paste|--copy] [--toggle]  окно шаблонов (папка templates: файлы .txt или без расширения, подпапки, симлинки)
+  clipd tpl-export [--prune]  скопировать все шаблоны в templates_export_dir (для jbak2 на Android)
   clipd send [УСТРОЙСТВО]  отправить текущий буфер в to_<УСТРОЙСТВО>.txt (all - всем)
   clipd store [--primary]  служебное: принять содержимое буфера со stdin
 
@@ -48,6 +50,15 @@ DEFAULTS = {
     "rows_per_tab": 200,
     "row_lines": 4,                  # сколько строк многострочной записи показывать в списке
     "refresh_ms": 1000,              # как часто окно истории проверяет, не появились ли новые записи
+    "templates_dir": "",                                 # папка шаблонов; пусто - <sync_dir>/templates
+    "templates_exts": ["txt", ""],                       # какие файлы считать шаблонами: расширения ("" - без расширения)
+    "templates_action": "paste",                         # что делает выбор шаблона: paste (вставить в активное окно) | copy
+    "templates_strip_newline": True,                     # убирать перевод строки в конце текста (иначе в терминале команда сразу выполнится)
+    "templates_max_bytes": 200000,                       # шаблон больше этого размера обрезается
+    "templates_export_dir": str(HOME / "Syncthing/jbak2/templates/trixie"),   # куда копирует `clipd tpl-export`
+    "terminal_apps": ["foot", "xterm", "lxterminal", "qterminal", "xfce4-terminal", "alacritty", "kitty", "terminator",
+                      "konsole", "gnome-terminal", "tilix", "wezterm", "urxvt", "sakura", "terminology"],
+    "paste_mods_terminal": ["ctrl", "shift"],            # вставка в терминалы (определяются по app_id окна, список выше)
     "window_width": 700,
     "window_height": 540,
     "close_on_focus_out": True,                          # закрывать окно при клике мимо
@@ -286,6 +297,10 @@ def deliver(cfg, text, paste):
     log(f"refocus: {'отправлено' if ok else 'значок не запущен'}")
     time.sleep(cfg["paste_delay_ms"] / 1000)
     mods = cfg["paste_mods"]
+    app = read_text(RUN / "osk-focus-app").strip().lower()     # значок записывает app_id окна, которому вернул фокус
+    if app and any(x in app for x in cfg["terminal_apps"]):
+        mods = cfg["paste_mods_terminal"]
+    log(f"окно: {app or 'неизвестно'} -> модификаторы вставки {mods}")
     args = ([wtype] + [x for m in mods for x in ("-M", m)] + ["-k", "v"]
             + [x for m in reversed(mods) for x in ("-m", m)])
     r = subprocess.run(args, capture_output=True, text=True)
@@ -450,18 +465,19 @@ def panel_height():
         return 40
 
 
-def load_geo():
+def load_geo(path=None):
     try:
-        d = json.loads(WIN_STATE.read_text())
+        d = json.loads((path or WIN_STATE).read_text())
         return {k: int(d[k]) for k in ("x", "y", "w", "h")}
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def save_geo(geo):
+def save_geo(geo, path=None):
     try:
-        WIN_STATE.parent.mkdir(parents=True, exist_ok=True)
-        WIN_STATE.write_text(json.dumps(geo))
+        path = path or WIN_STATE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(geo))
     except OSError:
         pass
 
@@ -876,14 +892,18 @@ def build_window(cfg, tabs, choose, L=None):
     return win, nb, lists, search, state
 
 
-def pick_running():
+def proc_running(pidfile):
     try:
-        pid = int(PICK_PID.read_text())
+        pid = int(pidfile.read_text())
         if b"clipd" in Path(f"/proc/{pid}/cmdline").read_bytes() and pid != os.getpid():
             return pid
     except (OSError, ValueError):
         pass
     return None
+
+
+def pick_running():
+    return proc_running(PICK_PID)
 
 
 def cmd_pick_gtk(cfg, paste, toggle=False):
@@ -939,6 +959,499 @@ def cmd_pick(cfg, paste, toggle=False):
         cmd_pick_menu(cfg, paste)
 
 
+# ---------- шаблоны ----------
+
+TPL_WIN = STATE_DIR / "tpl-win.json"            # размер и положение окна шаблонов
+TPL_PID = RUN / "clipd-tpl.pid"
+
+
+def tpl_root(cfg):
+    d = cfg["templates_dir"] or str(Path(cfg["sync_dir"]) / "templates")
+    return Path(os.path.expanduser(d))
+
+
+def tpl_exts(cfg):
+    return {str(e).lower().lstrip(".") for e in cfg["templates_exts"]}
+
+
+def tpl_name_ok(name, cfg):
+    """Шаблон - только файл с разрешённым расширением (по умолчанию txt и без расширения); скрытые и временные пропускаем."""
+    if name.startswith(".") or name.endswith("~"):
+        return False
+    ext = Path(name).suffix.lower().lstrip(".")
+    return ext in tpl_exts(cfg)
+
+
+def tpl_display(name):
+    return name[:-4] if name.lower().endswith(".txt") else name
+
+
+def tpl_scan(root, cfg, _anc=None):
+    """Дерево шаблонов: {"dirs": [(имя, узел)], "files": [(имя для списка, путь, mtime)]}.
+    Симлинки на папки и файлы работают (is_dir/is_file идут по ссылке); от петель страхуемся realpath предков.
+    Пустые папки (где нет ни одного шаблона) не показываем."""
+    anc = set(_anc or ())
+    try:
+        real = os.path.realpath(root)
+    except OSError:
+        return {"dirs": [], "files": []}
+    anc.add(real)
+    dirs, files = [], []
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name.casefold())
+    except OSError:
+        return {"dirs": [], "files": []}
+    for e in entries:
+        if e.name.startswith("."):
+            continue
+        try:
+            if e.is_dir():
+                if os.path.realpath(e.path) in anc:
+                    continue
+                sub = tpl_scan(e.path, cfg, anc)
+                if sub["dirs"] or sub["files"]:
+                    dirs.append((e.name, sub))
+            elif e.is_file() and tpl_name_ok(e.name, cfg):
+                files.append((tpl_display(e.name), e.path, e.stat().st_mtime_ns))
+        except OSError:
+            continue                                        # битая ссылка и т.п.
+    return {"dirs": dirs, "files": files}
+
+
+def tpl_walk(node, prefix=()):
+    """Все шаблоны дерева: (путь из папок, имя, путь к файлу)."""
+    for name, path, _mt in node["files"]:
+        yield prefix, name, path
+    for dname, sub in node["dirs"]:
+        yield from tpl_walk(sub, prefix + (dname,))
+
+
+def tpl_sig(node):
+    return (tuple((n, p, m) for n, p, m in node["files"]),
+            tuple((n, tpl_sig(s)) for n, s in node["dirs"]))
+
+
+def tpl_read(cfg, path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(int(cfg["templates_max_bytes"]) + 1)
+    except OSError:
+        return ""
+    if len(data) > int(cfg["templates_max_bytes"]):
+        data = data[:int(cfg["templates_max_bytes"])]
+    return data.decode("utf-8", "replace").replace("\x00", "")
+
+
+def build_tpl_window(cfg, L, root, choose, default_action):
+    """Окно шаблонов: папки как строки (вход по двойному клику), поиск по всем шаблонам, вставка/копирование."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango
+
+    win = Gtk.Window(title="Шаблоны")
+    layer = bool(L) and L.is_supported()
+    disp = Gdk.Display.get_default()
+    try:
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        SW, SH = mon.get_geometry().width, mon.get_geometry().height
+    except Exception:
+        SW, SH = 1920, 1080
+    geo = None
+    if layer:
+        reserved = osk_reserved() + (panel_height() if osk_reserved() else 0)
+        saved = load_geo(TPL_WIN)
+        w = max(360, min(saved["w"] if saved else cfg["window_width"], SW))
+        h = max(240, min(saved["h"] if saved else cfg["window_height"], SH - 20))
+        if saved:
+            x, y = saved["x"], saved["y"]
+        else:
+            x = (SW - w) // 2
+            y = max(10, SH - reserved - h - 20) if reserved else max(10, (SH - h) // 2)
+        geo = {"x": max(0, min(x, SW - w)), "y": max(0, min(y, SH - 60)), "w": w, "h": h}
+        L.init_for_window(win)
+        L.set_namespace(win, "osk-tpl")
+        L.set_layer(win, L.Layer.OVERLAY)
+        if hasattr(L, "set_keyboard_mode"):
+            L.set_keyboard_mode(win, L.KeyboardMode.ON_DEMAND)
+        else:
+            L.set_keyboard_interactivity(win, True)
+        L.set_exclusive_zone(win, -1)
+        L.set_anchor(win, L.Edge.TOP, True)
+        L.set_anchor(win, L.Edge.LEFT, True)
+        L.set_margin(win, L.Edge.TOP, geo["y"])
+        L.set_margin(win, L.Edge.LEFT, geo["x"])
+        win.set_default_size(geo["w"], geo["h"])
+        win.set_size_request(geo["w"], geo["h"])
+        win.set_decorated(False)
+        css = Gtk.CssProvider()
+        css.load_from_data(b""".osk-clip { border: 1px solid #777; border-radius: 8px; }
+                              .osk-head { font-weight: bold; padding: 4px 6px; }
+                              .osk-grip { padding: 2px 6px; color: #888; }
+                              .osk-path { padding: 2px 6px; color: #888; }""")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    else:
+        win.set_default_size(cfg["window_width"], cfg["window_height"])
+        win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        win.set_keep_above(True)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    box.get_style_context().add_class("osk-clip")
+    for side in ("top", "bottom", "start", "end"):
+        getattr(box, f"set_margin_{side}")(6)
+    win.add(box)
+
+    if layer:                                                # заголовок: перетаскивание и крестик
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        handle = Gtk.EventBox()
+        handle.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                          Gdk.EventMask.POINTER_MOTION_MASK)
+        title = Gtk.Label(label="☰  Шаблоны  (потяните, чтобы переместить)")
+        title.set_xalign(0)
+        title.get_style_context().add_class("osk-head")
+        handle.add(title)
+        head.pack_start(handle, True, True, 0)
+        close = Gtk.Button(label="✕")
+        close.set_focus_on_click(False)
+        close.connect("clicked", lambda *_: win.close())
+        head.pack_start(close, False, False, 0)
+        box.pack_start(head, False, False, 0)
+        drag = {"on": False, "x": 0, "y": 0}
+
+        def h_press(_w, ev):
+            if ev.button == 1:
+                drag.update(on=True, x=ev.x, y=ev.y)
+            return True
+
+        def h_motion(_w, ev):
+            if drag["on"]:
+                geo["x"] = max(0, min(geo["x"] + int(ev.x - drag["x"]), SW - 80))
+                geo["y"] = max(0, min(geo["y"] + int(ev.y - drag["y"]), SH - 40))
+                L.set_margin(win, L.Edge.TOP, geo["y"])
+                L.set_margin(win, L.Edge.LEFT, geo["x"])
+                win.queue_resize()
+            return True
+
+        def h_release(_w, ev):
+            drag["on"] = False
+            save_geo(geo, TPL_WIN)
+            return True
+
+        handle.connect("button-press-event", h_press)
+        handle.connect("motion-notify-event", h_motion)
+        handle.connect("button-release-event", h_release)
+
+    search = Gtk.SearchEntry()
+    search.set_placeholder_text("Поиск по всем шаблонам (по имени и тексту)...")
+    box.pack_start(search, False, False, 0)
+    pathlab = Gtk.Label()
+    pathlab.set_xalign(0)
+    pathlab.get_style_context().add_class("osk-path")
+    box.pack_start(pathlab, False, False, 0)
+    lb = Gtk.ListBox()
+    lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
+    lb.set_activate_on_single_click(False)
+    sw = Gtk.ScrolledWindow()
+    sw.add(lb)
+    box.pack_start(sw, True, True, 0)
+
+    st = {"tree": tpl_scan(root, cfg), "path": [], "q": "", "cache": {}}
+    st["sig"] = tpl_sig(st["tree"])
+
+    def text_of(path):
+        try:
+            mt = os.stat(path).st_mtime_ns
+        except OSError:
+            return ""
+        c = st["cache"].get(path)
+        if c is None or c[0] != mt:
+            c = (mt, tpl_read(cfg, path))
+            st["cache"][path] = c
+        return c[1]
+
+    def node_here():
+        n = st["tree"]
+        for name in st["path"]:
+            n = dict(n["dirs"]).get(name)
+            if n is None:
+                st["path"] = []
+                return st["tree"]
+        return n
+
+    def mk_row(kind, label, sub=None, **attrs):
+        row = Gtk.ListBoxRow()
+        row.kind = kind
+        for k, v in attrs.items():
+            setattr(row, k, v)
+        rb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(rb, f"set_margin_{side}")(5)
+        l1 = Gtk.Label()
+        l1.set_markup("<b>" + GLib.markup_escape_text(label) + "</b>")
+        l1.set_xalign(0)
+        l1.set_ellipsize(Pango.EllipsizeMode.END)
+        rb.pack_start(l1, False, False, 0)
+        if sub:
+            l2 = Gtk.Label(label=sub)
+            l2.set_xalign(0)
+            l2.set_line_wrap(True)
+            l2.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            rb.pack_start(l2, False, False, 0)
+        row.add(rb)
+        return row
+
+    def populate():
+        for ch in lb.get_children():
+            lb.remove(ch)
+        n_rows = int(cfg["row_lines"])
+        q = st["q"]
+        if q:
+            pathlab.set_text("Поиск: " + q)
+            found = 0
+            for prefix, name, path in tpl_walk(st["tree"]):
+                text = text_of(path)
+                if q in name.lower() or q in text.lower():
+                    where = ("/".join(prefix) + "/") if prefix else ""
+                    lb.add(mk_row("file", where + name, short_text(text, n_rows), path=path))
+                    found += 1
+                    if found >= 200:
+                        break
+            if not found:
+                lb.add(mk_row("none", "Ничего не найдено"))
+        else:
+            pathlab.set_text("Шаблоны" + "".join(" / " + p for p in st["path"]))
+            node = node_here()
+            if st["path"]:
+                lb.add(mk_row("up", "⬑  .. (назад)"))
+            for name, sub in node["dirs"]:
+                cnt = sum(1 for _ in tpl_walk(sub))
+                lb.add(mk_row("dir", "\U0001F4C1  " + name, f"шаблонов: {cnt}", dir=name))
+            for name, path, _mt in node["files"]:
+                lb.add(mk_row("file", name, short_text(text_of(path), n_rows), path=path))
+            if not node["dirs"] and not node["files"]:
+                lb.add(mk_row("none", "Здесь пока нет шаблонов",
+                              f"Положите файлы .txt (или без расширения) в папку:\n{root}"))
+        lb.show_all()
+        first = next((r for r in lb.get_children() if r.kind in ("file", "dir")), None)
+        if first is not None:
+            lb.select_row(first)
+
+    def activate(row, action):
+        if row.kind == "up":
+            st["path"] = st["path"][:-1]
+            populate()
+        elif row.kind == "dir":
+            st["path"] = st["path"] + [row.dir]
+            populate()
+        elif row.kind == "file":
+            choose(text_of(row.path), action)
+
+    lb.connect("row-activated", lambda _lb, row: activate(row, default_action))
+
+    def selected():
+        return lb.get_selected_row()
+
+    def do_btn(action):
+        row = selected()
+        if row is None or row.kind in ("none",):
+            notify("Сначала выберите шаблон (клик по нему)")
+            return
+        activate(row, action)
+
+    def on_search(entry):
+        st["q"] = entry.get_text().lower().strip()
+        populate()
+
+    def on_search_enter(_e):
+        row = next((r for r in lb.get_children() if r.kind == "file"), None)
+        if row is not None:
+            choose(text_of(row.path), default_action)
+
+    search.connect("search-changed", on_search)
+    search.connect("activate", on_search_enter)
+
+    bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    b_paste = Gtk.Button(label="Вставить")
+    b_copy = Gtk.Button(label="Копировать")
+    for b in (b_paste, b_copy):
+        b.set_focus_on_click(False)
+        bottom.pack_start(b, False, False, 0)
+    b_paste.connect("clicked", lambda *_: do_btn("paste"))
+    b_copy.connect("clicked", lambda *_: do_btn("copy"))
+    if layer:
+        grip_box = Gtk.EventBox()
+        grip_box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                            Gdk.EventMask.POINTER_MOTION_MASK)
+        grip = Gtk.Label(label="◢  размер")
+        grip.get_style_context().add_class("osk-grip")
+        grip_box.add(grip)
+        bottom.pack_end(grip_box, False, False, 0)
+        rs = {"on": False, "x": 0, "y": 0}
+
+        def g_press(_w, ev):
+            if ev.button == 1:
+                rs.update(on=True, x=ev.x, y=ev.y)
+            return True
+
+        def g_motion(_w, ev):
+            if rs["on"]:
+                geo["w"] = max(360, min(geo["w"] + int(ev.x - rs["x"]), SW - geo["x"]))
+                geo["h"] = max(240, min(geo["h"] + int(ev.y - rs["y"]), SH - geo["y"]))
+                win.set_size_request(geo["w"], geo["h"])
+                win.resize(geo["w"], geo["h"])
+            return True
+
+        def g_release(_w, ev):
+            rs["on"] = False
+            save_geo(geo, TPL_WIN)
+            return True
+
+        grip_box.connect("button-press-event", g_press)
+        grip_box.connect("motion-notify-event", g_motion)
+        grip_box.connect("button-release-event", g_release)
+    box.pack_start(bottom, False, False, 0)
+
+    def refresh():
+        """Файлы шаблонов поменялись (Syncthing, редактор) - перечитываем."""
+        new = tpl_scan(root, cfg)
+        sig = tpl_sig(new)
+        if sig != st["sig"]:
+            st["tree"], st["sig"] = new, sig
+            keep = selected()
+            populate()
+        return True
+
+    GLib.timeout_add(2000, refresh)
+
+    def on_key(_w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            if st["q"]:
+                search.set_text("")
+            else:
+                win.close()
+            return True
+        if ev.keyval == Gdk.KEY_BackSpace and not search.has_focus() and not st["q"] and st["path"]:
+            st["path"] = st["path"][:-1]
+            populate()
+            return True
+        return False
+
+    win.connect("key-press-event", on_key)
+    populate()
+    return win, search
+
+
+def cmd_tpl(cfg, a):
+    paste_default = cfg["templates_action"] != "copy"
+    if "--copy" in a:
+        paste_default = False
+    if "--paste" in a:
+        paste_default = True
+    default_action = "paste" if paste_default else "copy"
+    pid = proc_running(TPL_PID)
+    if pid and "--toggle" in a:
+        os.kill(pid, signal.SIGTERM)
+        return
+    root = tpl_root(cfg)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        notify(f"Папка шаблонов недоступна: {root} ({e})")
+        return
+    L = import_layer_shell()
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import GLib, Gtk
+    except Exception as e:
+        log(f"GTK недоступен: {e}")
+        notify("Нет GTK для окна шаблонов: sudo apt install python3-gi gir1.2-gtk-3.0")
+        return
+    chosen = {"text": None, "action": default_action}
+
+    def choose(text, action):
+        chosen["text"], chosen["action"] = text, action
+        win.close()
+
+    win, search = build_tpl_window(cfg, L, root, choose, default_action)
+    win.connect("destroy", Gtk.main_quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (win.close(), False)[1])
+    try:
+        TPL_PID.write_text(str(os.getpid()))
+    except OSError:
+        pass
+    win.show_all()
+    search.grab_focus()
+    log(f"окно шаблонов открыто: {root}, layer-shell: {bool(L)}")
+    Gtk.main()
+    try:
+        TPL_PID.unlink()
+    except OSError:
+        pass
+    text = chosen["text"]
+    if text is None:
+        return
+    if cfg["templates_strip_newline"]:
+        text = text.rstrip("\r\n")                     # хвостовой перевод строки при вставке в терминал выполнил бы команду
+    paste = chosen["action"] == "paste"
+    log(f"шаблон: {len(text)} символов, действие {chosen['action']}")
+    deliver(cfg, text, paste)
+    if not paste:
+        notify("Шаблон скопирован в буфер обмена")
+
+
+def cmd_tpl_export(cfg, a):
+    """Копия всех шаблонов в другую папку (по умолчанию - для jbak2 keyboard на Android). Только txt/без расширения,
+    ссылки раскрываются (копируется содержимое), подпапки сохраняются, неизменённые файлы не трогаем (Syncthing)."""
+    src = tpl_root(cfg)
+    dst = Path(os.path.expanduser(cfg["templates_export_dir"]))
+    if not str(cfg["templates_export_dir"]).strip():
+        print("templates_export_dir не задан в osk.toml")
+        return 1
+    rs, rd = os.path.realpath(src), os.path.realpath(dst)
+    if rs == rd or rd.startswith(rs + os.sep) or rs.startswith(rd + os.sep):
+        msg = f"Папки шаблонов и экспорта не должны совпадать или лежать одна в другой: {src} / {dst}"
+        print(msg)
+        notify(msg)
+        return 1
+    if not src.is_dir():
+        print(f"Нет папки шаблонов: {src}")
+        return 1
+    dst.mkdir(parents=True, exist_ok=True)
+    tree = tpl_scan(src, cfg)
+    copied = same = 0
+    keep = set()
+    for prefix, _name, path in tpl_walk(tree):
+        target = dst.joinpath(*prefix) / os.path.basename(path)
+        keep.add(os.path.realpath(target))
+        data = Path(path).read_bytes()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and target.read_bytes() == data:
+            same += 1
+            continue
+        tmp = target.with_name(f".syncthing.{target.name}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+        copied += 1
+    removed = 0
+    if "--prune" in a:                                    # убрать в папке назначения файлы, которых больше нет в источнике
+        for dp, _dn, fn in os.walk(dst, topdown=False):
+            for f in fn:
+                p = Path(dp) / f
+                if tpl_name_ok(f, cfg) and os.path.realpath(p) not in keep:
+                    p.unlink()
+                    removed += 1
+            try:
+                os.rmdir(dp) if Path(dp) != dst else None
+            except OSError:
+                pass
+    msg = f"Шаблоны -> {dst}: скопировано {copied}, без изменений {same}" + (f", удалено {removed}" if removed else "")
+    print(msg)
+    log(msg)
+    notify(msg)
+    return 0
+
+
 # ---------- send ----------
 
 def cmd_send(cfg, target):
@@ -967,6 +1480,10 @@ def main():
         cmd_watch(cfg)
     elif cmd == "store":
         cmd_store(cfg, "--primary" in a)
+    elif cmd == "tpl":
+        cmd_tpl(cfg, a)
+    elif cmd == "tpl-export":
+        sys.exit(cmd_tpl_export(cfg, a))
     elif cmd == "pick":
         cmd_pick(cfg, "--paste" in a, "--toggle" in a)
     elif cmd == "send":

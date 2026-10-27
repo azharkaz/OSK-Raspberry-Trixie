@@ -565,10 +565,18 @@ class Toplevels:
             return False
         la = self.last_active
         if la in self.items and 1 not in self.items[la]["state"]:
+            try:                                    # clipd по app_id выбирает способ вставки (терминалу нужен Ctrl+Shift+V)
+                (RUN / "osk-focus-app").write_text(self.items[la]["app_id"])
+            except OSError:
+                pass
             dbg("refocus: окно", self.items[la]["app_id"], "|", self.items[la]["title"])
             logf("refocus: возвращаю фокус окну " + self.items[la]["app_id"] + " | " + self.items[la]["title"])
             self.activate(la)
             return True
+        try:
+            (RUN / "osk-focus-app").write_text("")
+        except OSError:
+            pass
         logf("refocus: некому возвращать фокус (последнее рабочее окно неизвестно или свёрнуто)")
         return False
 
