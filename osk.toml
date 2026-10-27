@@ -50,6 +50,11 @@ templates_exts = ["txt", ""]             # какие файлы считают�
 templates_action = "paste"               # что делает выбор шаблона: paste (вставить в активное окно) | copy (только в буфер)
 templates_strip_newline = true           # убирать перевод строки в конце (иначе вставленная в терминал команда сразу выполнится)
 templates_export_dir = "~/Syncthing/jbak2/templates/trixie"   # куда копирует `clipd tpl-export` (создаётся, если нет)
+templates_export_strip_ext = true        # при экспорте убирать .txt из имени (формат jbak2 - без расширения)
+templates_export_strip_newline = true    # при экспорте убирать перевод строки в конце файла
+templates_export_prune = true            # удалять в папке экспорта шаблоны, которых больше нет у нас (только там, jbak2 не трогается)
+# внешние папки шаблонов (показываются в окне как папки; они НЕ экспортируются обратно - дублей не будет). Можно несколько.
+templates_extra = [ { label = "jbak2", dir = "~/Syncthing/jbak2/templates", all_files = true } ]
 terminal_apps = ["foot", "xterm", "lxterminal", "qterminal", "xfce4-terminal", "alacritty", "kitty", "terminator", "konsole", "gnome-terminal", "tilix", "wezterm", "urxvt", "sakura", "terminology"]
 paste_mods_terminal = ["ctrl", "shift"]  # вставка в терминалы (окно узнаётся по app_id из списка выше); для остальных - paste_mods
 window_width = 700

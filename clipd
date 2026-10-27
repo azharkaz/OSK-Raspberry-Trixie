@@ -5,7 +5,7 @@
   clipd watch              демон: следит за буфером (запускать из autostart)
   clipd pick [--paste] [--toggle]  окно истории (--toggle: повторный вызов закрывает окно); меню: входящие, последние клипы и история всех устройств
   clipd tpl [--paste|--copy] [--toggle]  окно шаблонов (папка templates: файлы .txt или без расширения, подпапки, симлинки)
-  clipd tpl-export [--prune]  скопировать все шаблоны в templates_export_dir (для jbak2 на Android)
+  clipd tpl-export [--force] [--no-prune]  скопировать наши шаблоны в templates_export_dir (для jbak2 на Android, без дублей)
   clipd send [УСТРОЙСТВО]  отправить текущий буфер в to_<УСТРОЙСТВО>.txt (all - всем)
   clipd store [--primary]  служебное: принять содержимое буфера со stdin
 
@@ -56,6 +56,11 @@ DEFAULTS = {
     "templates_strip_newline": True,                     # убирать перевод строки в конце текста (иначе в терминале команда сразу выполнится)
     "templates_max_bytes": 200000,                       # шаблон больше этого размера обрезается
     "templates_export_dir": str(HOME / "Syncthing/jbak2/templates/trixie"),   # куда копирует `clipd tpl-export`
+    "templates_extra": [{"label": "jbak2", "dir": str(HOME / "Syncthing/jbak2/templates"), "all_files": True}],
+                                                         # чужие папки шаблонов, которые только показываем (как папку в списке)
+    "templates_export_strip_ext": True,                  # при экспорте убирать .txt из имени (в jbak2 шаблоны без расширения)
+    "templates_export_strip_newline": True,              # при экспорте убирать перевод строки в конце текста (как у шаблонов jbak2)
+    "templates_export_prune": True,                      # убирать в папке экспорта файлы, которых больше нет у нас (только внутри неё)
     "terminal_apps": ["foot", "xterm", "lxterminal", "qterminal", "xfce4-terminal", "alacritty", "kitty", "terminator",
                       "konsole", "gnome-terminal", "tilix", "wezterm", "urxvt", "sakura", "terminology"],
     "paste_mods_terminal": ["ctrl", "shift"],            # вставка в терминалы (определяются по app_id окна, список выше)
@@ -974,22 +979,40 @@ def tpl_exts(cfg):
     return {str(e).lower().lstrip(".") for e in cfg["templates_exts"]}
 
 
-def tpl_name_ok(name, cfg):
-    """Шаблон - только файл с разрешённым расширением (по умолчанию txt и без расширения); скрытые и временные пропускаем."""
-    if name.startswith(".") or name.endswith("~"):
+def tpl_name_ok(name, cfg, all_files=False):
+    """Шаблон - файл с разрешённым расширением (по умолчанию txt и без расширения); скрытые и временные пропускаем.
+    all_files (для чужих папок, например jbak2): берём любой файл с именем без служебных признаков - в имени
+    шаблона jbak2 бывают точки, не являющиеся расширением; бинарные файлы отсеиваются по содержимому."""
+    if name.startswith(".") or name.endswith("~") or name.endswith(".tmp"):
         return False
+    if all_files:
+        return True
     ext = Path(name).suffix.lower().lstrip(".")
     return ext in tpl_exts(cfg)
+
+
+def tpl_is_text(path):
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(2048)
+        if b"\0" in chunk:
+            return False
+        chunk.decode("utf-8")
+        return True
+    except UnicodeDecodeError as e:
+        return e.reason == "unexpected end of data" or e.end >= len(chunk) - 3      # обрезанный на границе символ
+    except OSError:
+        return False
 
 
 def tpl_display(name):
     return name[:-4] if name.lower().endswith(".txt") else name
 
 
-def tpl_scan(root, cfg, _anc=None):
+def tpl_scan(root, cfg, _anc=None, all_files=False, skip=()):
     """Дерево шаблонов: {"dirs": [(имя, узел)], "files": [(имя для списка, путь, mtime)]}.
     Симлинки на папки и файлы работают (is_dir/is_file идут по ссылке); от петель страхуемся realpath предков.
-    Пустые папки (где нет ни одного шаблона) не показываем."""
+    Пустые папки (где нет ни одного шаблона) не показываем. skip - realpath папок, которые не заходим (папка экспорта)."""
     anc = set(_anc or ())
     try:
         real = os.path.realpath(root)
@@ -1006,16 +1029,48 @@ def tpl_scan(root, cfg, _anc=None):
             continue
         try:
             if e.is_dir():
-                if os.path.realpath(e.path) in anc:
+                rp = os.path.realpath(e.path)
+                if rp in anc or rp in skip:
                     continue
-                sub = tpl_scan(e.path, cfg, anc)
+                sub = tpl_scan(e.path, cfg, anc, all_files, skip)
                 if sub["dirs"] or sub["files"]:
                     dirs.append((e.name, sub))
-            elif e.is_file() and tpl_name_ok(e.name, cfg):
+            elif e.is_file() and tpl_name_ok(e.name, cfg, all_files):
+                if all_files and Path(e.name).suffix.lower().lstrip(".") not in tpl_exts(cfg) and not tpl_is_text(e.path):
+                    continue
                 files.append((tpl_display(e.name), e.path, e.stat().st_mtime_ns))
         except OSError:
             continue                                        # битая ссылка и т.п.
     return {"dirs": dirs, "files": files}
+
+
+def tpl_extras(cfg):
+    out = []
+    for x in cfg["templates_extra"] or []:
+        try:
+            d = os.path.expanduser(str(x["dir"]))
+        except (KeyError, TypeError):
+            continue
+        out.append((str(x.get("label") or Path(d).name), d, bool(x.get("all_files", True))))
+    return out
+
+
+def tpl_tree(cfg):
+    """Наши шаблоны + чужие папки (jbak2 и т.п.) как отдельные папки списка. Папку экспорта в чужих папках не показываем,
+    иначе наши же шаблоны отобразились бы дважды."""
+    tree = tpl_scan(tpl_root(cfg), cfg)
+    skip = set()
+    if str(cfg["templates_export_dir"]).strip():
+        skip.add(os.path.realpath(os.path.expanduser(cfg["templates_export_dir"])))
+    own_real = os.path.realpath(tpl_root(cfg))
+    for label, d, allf in tpl_extras(cfg):
+        if not os.path.isdir(d) or os.path.realpath(d) == own_real:
+            continue
+        sub = tpl_scan(d, cfg, all_files=allf, skip=skip)
+        if sub["dirs"] or sub["files"]:
+            names = {n for n, _ in tree["dirs"]}
+            tree["dirs"].append((label if label not in names else label + " (внешняя)", sub))
+    return tree
 
 
 def tpl_walk(node, prefix=()):
@@ -1155,7 +1210,7 @@ def build_tpl_window(cfg, L, root, choose, default_action):
     sw.add(lb)
     box.pack_start(sw, True, True, 0)
 
-    st = {"tree": tpl_scan(root, cfg), "path": [], "q": "", "cache": {}}
+    st = {"tree": tpl_tree(cfg), "path": [], "q": "", "cache": {}}
     st["sig"] = tpl_sig(st["tree"])
 
     def text_of(path):
@@ -1313,7 +1368,7 @@ def build_tpl_window(cfg, L, root, choose, default_action):
 
     def refresh():
         """Файлы шаблонов поменялись (Syncthing, редактор) - перечитываем."""
-        new = tpl_scan(root, cfg)
+        new = tpl_tree(cfg)
         sig = tpl_sig(new)
         if sig != st["sig"]:
             st["tree"], st["sig"] = new, sig
@@ -1401,16 +1456,25 @@ def cmd_tpl(cfg, a):
 
 
 def cmd_tpl_export(cfg, a):
-    """Копия всех шаблонов в другую папку (по умолчанию - для jbak2 keyboard на Android). Только txt/без расширения,
-    ссылки раскрываются (копируется содержимое), подпапки сохраняются, неизменённые файлы не трогаем (Syncthing)."""
+    """Копия НАШИХ шаблонов в другую папку (по умолчанию - подпапка trixie внутри папки jbak2 keyboard).
+    Как у jbak2: имя без .txt, текст без перевода строки в конце. Ссылки раскрываются, подпапки сохраняются.
+    Дублей не будет: чужие шаблоны (папки templates_extra и всё, что на них ссылается) не копируются, папка экспорта
+    в списке чужих не показывается, неизменённые файлы не трогаем; файл, изменённый на телефоне позже (новее нашего),
+    не перезаписываем (--force - перезаписать)."""
     src = tpl_root(cfg)
-    dst = Path(os.path.expanduser(cfg["templates_export_dir"]))
     if not str(cfg["templates_export_dir"]).strip():
         print("templates_export_dir не задан в osk.toml")
         return 1
+    dst = Path(os.path.expanduser(cfg["templates_export_dir"]))
     rs, rd = os.path.realpath(src), os.path.realpath(dst)
+    extras = [os.path.realpath(d) for _l, d, _f in tpl_extras(cfg)]
     if rs == rd or rd.startswith(rs + os.sep) or rs.startswith(rd + os.sep):
         msg = f"Папки шаблонов и экспорта не должны совпадать или лежать одна в другой: {src} / {dst}"
+        print(msg)
+        notify(msg)
+        return 1
+    if rd in extras:
+        msg = f"Папка экспорта не должна быть корнем чужой папки шаблонов ({dst}): нужна подпапка, например .../trixie"
         print(msg)
         notify(msg)
         return 1
@@ -1418,23 +1482,44 @@ def cmd_tpl_export(cfg, a):
         print(f"Нет папки шаблонов: {src}")
         return 1
     dst.mkdir(parents=True, exist_ok=True)
-    tree = tpl_scan(src, cfg)
-    copied = same = 0
+    skip_files = tuple(e + os.sep for e in extras)
+    tree = tpl_scan(src, cfg, skip={rd})
+    copied = same = foreign = clash = newer = 0
     keep = set()
+    force = "--force" in a
     for prefix, _name, path in tpl_walk(tree):
-        target = dst.joinpath(*prefix) / os.path.basename(path)
-        keep.add(os.path.realpath(target))
-        data = Path(path).read_bytes()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and target.read_bytes() == data:
-            same += 1
+        if os.path.realpath(path).startswith(skip_files):          # это чужой шаблон (например, ссылка на папку jbak2)
+            foreign += 1
             continue
+        fname = os.path.basename(path)
+        if cfg["templates_export_strip_ext"] and fname.lower().endswith(".txt"):
+            fname = fname[:-4]
+        target = dst.joinpath(*prefix) / fname
+        rt = os.path.realpath(target)
+        if rt in keep:                                              # a.txt и a дали бы одно имя
+            clash += 1
+            print(f"пропущен (то же имя после экспорта): {path}")
+            continue
+        keep.add(rt)
+        data = Path(path).read_bytes()
+        if cfg["templates_export_strip_newline"]:
+            data = data.rstrip(b"\r\n")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if target.read_bytes() == data:
+                same += 1
+                continue
+            if not force and target.stat().st_mtime_ns > os.stat(path).st_mtime_ns:
+                newer += 1
+                print(f"не тронут (в папке экспорта новее - правили на телефоне?): {target}")
+                continue
         tmp = target.with_name(f".syncthing.{target.name}.tmp")
         tmp.write_bytes(data)
         os.replace(tmp, target)
         copied += 1
     removed = 0
-    if "--prune" in a:                                    # убрать в папке назначения файлы, которых больше нет в источнике
+    prune = bool(cfg["templates_export_prune"]) and "--no-prune" not in a
+    if prune:                                             # внутри папки экспорта убираем то, чего у нас больше нет
         for dp, _dn, fn in os.walk(dst, topdown=False):
             for f in fn:
                 p = Path(dp) / f
@@ -1442,10 +1527,15 @@ def cmd_tpl_export(cfg, a):
                     p.unlink()
                     removed += 1
             try:
-                os.rmdir(dp) if Path(dp) != dst else None
+                if Path(dp) != dst:
+                    os.rmdir(dp)
             except OSError:
                 pass
-    msg = f"Шаблоны -> {dst}: скопировано {copied}, без изменений {same}" + (f", удалено {removed}" if removed else "")
+    msg = (f"Шаблоны -> {dst}: скопировано {copied}, без изменений {same}"
+           + (f", удалено лишних {removed}" if removed else "")
+           + (f", оставлено (новее в jbak2) {newer}" if newer else "")
+           + (f", чужих пропущено {foreign}" if foreign else "")
+           + (f", конфликтов имён {clash}" if clash else ""))
     print(msg)
     log(msg)
     notify(msg)
