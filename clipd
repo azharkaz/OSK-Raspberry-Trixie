@@ -39,6 +39,7 @@ DEFAULTS = {
     "menu": "fuzzel",                                    # fuzzel | wofi
     "close_item": "top",                                 # пункт «Закрыть» в меню: top | bottom | off
     "menu_limit": 300,                                   # сколько пунктов показывать в меню
+    "paste_method": "type",                              # type = напечатать текст через wtype (без Ctrl+V, не зависит от приложения) | keys = нажать Ctrl+V
     "paste_delay_ms": 350,                               # пауза перед вставкой после закрытия окна
     "paste_mods": ["ctrl"],                              # для терминала: ["ctrl", "shift"]
     "ui": "gtk",                                         # gtk - окно с вкладками | fuzzel - простой список
@@ -306,6 +307,13 @@ def deliver(cfg, text, paste):
     if app and any(x in app for x in cfg["terminal_apps"]):
         mods = cfg["paste_mods_terminal"]
     log(f"окно: {app or 'неизвестно'} -> модификаторы вставки {mods}")
+    if str(cfg.get("paste_method", "type")).lower() == "type":
+        log(f"вставка: печать текста через wtype ({len(text)} символов)")
+        r = subprocess.run([wtype, "-d", "2", "-"], input=text, capture_output=True, text=True)   # "-" = текст из stdin
+        log(f"wtype rc={r.returncode} {r.stderr.strip()}")
+        if r.returncode:
+            notify("wtype не смог напечатать, см. ~/.cache/clipd/clipd.log")
+        return
     args = ([wtype] + [x for m in mods for x in ("-M", m)] + ["-k", "v"]
             + [x for m in reversed(mods) for x in ("-m", m)])
     r = subprocess.run(args, capture_output=True, text=True)
@@ -320,7 +328,7 @@ def cmd_testpaste(cfg):
     print("wl-copy: ", shutil.which("wl-copy") or "НЕ НАЙДЕН (sudo apt install wl-clipboard)")
     sock = RUN / "osk-tray.sock"
     print("значок:  ", "запущен" if sock.exists() else "не запущен (фокус возвращать некому)")
-    print("paste_mods:", cfg["paste_mods"], "| paste_delay_ms:", cfg["paste_delay_ms"])
+    print("paste_method:", cfg.get("paste_method"), "| paste_mods:", cfg["paste_mods"], "| paste_delay_ms:", cfg["paste_delay_ms"])
     print("Через 6 секунд вставлю TEST-VSTAVKA. Кликните сейчас в поле ввода (например, в mousepad)...")
     time.sleep(6)
     deliver(cfg, "TEST-VSTAVKA", True)
