@@ -39,7 +39,7 @@ DEFAULTS = {
     "menu": "fuzzel",                                    # fuzzel | wofi
     "close_item": "top",                                 # пункт «Закрыть» в меню: top | bottom | off
     "menu_limit": 300,                                   # сколько пунктов показывать в меню
-    "paste_method": "type",                              # type = напечатать текст через wtype (без Ctrl+V, не зависит от приложения) | keys = нажать Ctrl+V
+    "paste_method": "uinput",                            # uinput = Ctrl+V как от настоящей клавиатуры (надёжно) | keys = Ctrl+V через wtype | type = напечатать текст через wtype
     "paste_delay_ms": 350,                               # пауза перед вставкой после закрытия окна
     "paste_mods": ["ctrl"],                              # для терминала: ["ctrl", "shift"]
     "ui": "gtk",                                         # gtk - окно с вкладками | fuzzel - простой список
@@ -286,6 +286,28 @@ def refocus_tray():
         s.close()
 
 
+def uinput_paste(mods):
+    """Нажать mods+V на виртуальной клавиатуре ядра (uinput). Возвращает текст ошибки или ''."""
+    try:
+        from evdev import UInput, ecodes as e
+        names = {"ctrl": e.KEY_LEFTCTRL, "shift": e.KEY_LEFTSHIFT, "alt": e.KEY_LEFTALT, "logo": e.KEY_LEFTMETA}
+        mk = [names[m] for m in mods if m in names]
+        ui = UInput({e.EV_KEY: mk + [e.KEY_V]}, name="clipd-paste")
+        try:
+            time.sleep(0.6)                                  # композитор должен успеть подхватить новое устройство
+            for k in mk + [e.KEY_V]:
+                ui.write(e.EV_KEY, k, 1); ui.syn(); time.sleep(0.03)
+            time.sleep(0.03)
+            for k in [e.KEY_V] + mk[::-1]:
+                ui.write(e.EV_KEY, k, 0); ui.syn(); time.sleep(0.03)
+            time.sleep(0.15)
+        finally:
+            ui.close()
+        return ""
+    except Exception as ex:
+        return str(ex) or ex.__class__.__name__
+
+
 def deliver(cfg, text, paste):
     """Положить текст в буфер и (если нужно) вставить в активное окно."""
     log(f"deliver: {len(text)} символов, paste={paste}")
@@ -307,7 +329,13 @@ def deliver(cfg, text, paste):
     if app and any(x in app for x in cfg["terminal_apps"]):
         mods = cfg["paste_mods_terminal"]
     log(f"окно: {app or 'неизвестно'} -> модификаторы вставки {mods}")
-    if str(cfg.get("paste_method", "type")).lower() == "type":
+    method = str(cfg.get("paste_method", "uinput")).lower()
+    if method == "uinput":
+        err = uinput_paste(mods)
+        log("вставка: Ctrl+V через uinput " + ("ok" if not err else "ОШИБКА: " + err + " -> запасной вариант wtype"))
+        if not err:
+            return
+    elif method == "type":
         log(f"вставка: печать текста через wtype ({len(text)} символов)")
         r = subprocess.run([wtype, "-d", "2", "-"], input=text, capture_output=True, text=True)   # "-" = текст из stdin
         log(f"wtype rc={r.returncode} {r.stderr.strip()}")

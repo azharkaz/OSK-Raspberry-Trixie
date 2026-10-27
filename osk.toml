@@ -31,7 +31,7 @@ sync_dir = "~/Syncthing/Zametki_ALL/claude_bufer"
 max_entries = 500                # сколько записей хранить в clip_hist-<device>.txt
 max_bytes = 100000               # клипы больше этого размера не сохраняем
 primary = false                  # писать ли выделение мышью (PRIMARY)
-paste_method = "type"             # type = напечатать текст через wtype (без Ctrl+V; работает везде) | keys = нажать Ctrl+V (paste_mods)
+paste_method = "uinput"          # uinput = Ctrl+V как от настоящей клавиатуры (надёжно) | keys = Ctrl+V через wtype | type = печатать текст через wtype
 paste_delay_ms = 350             # пауза перед вставкой после закрытия окна
 paste_mods = ["ctrl"]            # для терминала: ["ctrl", "shift"]
 
