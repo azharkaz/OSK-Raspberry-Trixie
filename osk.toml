@@ -50,6 +50,8 @@ templates_dir = ""                       # папка шаблонов; пуст
 templates_exts = ["txt", ""]             # какие файлы считаются шаблонами: расширения ("" = файлы без расширения, как в jbak2)
 templates_action = "paste"               # что делает выбор шаблона: paste (вставить в активное окно) | copy (только в буфер)
 templates_strip_newline = true           # убирать перевод строки в конце (иначе вставленная в терминал команда сразу выполнится)
+templates_restore_clipboard = true       # после вставки шаблона вернуть в буфер прежнее содержимое (шаблон в историю не попадает)
+templates_restore_ms = 600               # сколько ждать после вставки перед возвратом буфера (мс)
 templates_export_dir = "~/Syncthing/jbak2/templates/trixie"   # куда копирует `clipd tpl-export` (создаётся, если нет)
 templates_export_strip_ext = true        # при экспорте убирать .txt из имени (формат jbak2 - без расширения)
 templates_export_strip_newline = true    # при экспорте убирать перевод строки в конце файла

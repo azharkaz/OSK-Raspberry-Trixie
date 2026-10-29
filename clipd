@@ -40,6 +40,8 @@ DEFAULTS = {
     "close_item": "top",                                 # пункт «Закрыть» в меню: top | bottom | off
     "menu_limit": 300,                                   # сколько пунктов показывать в меню
     "paste_method": "uinput",                            # uinput = Ctrl+V как от настоящей клавиатуры (надёжно) | keys = Ctrl+V через wtype | type = напечатать текст через wtype
+    "templates_restore_clipboard": True,                 # после вставки шаблона вернуть в буфер прежнее содержимое
+    "templates_restore_ms": 600,                         # сколько ждать после вставки перед возвратом буфера (приложение читает его не мгновенно)
     "paste_delay_ms": 350,                               # пауза перед вставкой после закрытия окна
     "paste_mods": ["ctrl"],                              # для терминала: ["ctrl", "shift"]
     "ui": "gtk",                                         # gtk - окно с вкладками | fuzzel - простой список
@@ -179,6 +181,8 @@ def cmd_store(cfg, primary=False):
         capture_output=True, text=True).stdout
     if "passwordManagerHint" in types:      # менеджеры паролей помечают свои клипы
         return
+    if skip_hit(text):                       # это наша вставка шаблона / возврат прежнего буфера - в историю не пишем
+        return
     d = Path(cfg["sync_dir"])
     if not d.is_dir():
         return
@@ -308,7 +312,93 @@ def uinput_paste(mods):
         return str(ex) or ex.__class__.__name__
 
 
-def deliver(cfg, text, paste):
+SKIPF = RUN / "clipd-skip"
+
+
+def _h(text):
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def skip_mark(text):
+    """Запомнить текст, который мы кладём в буфер сами: демон истории его пропустит (20 с)."""
+    now = time.time()
+    keep = []
+    try:
+        for ln in SKIPF.read_text().splitlines():
+            ts, _, h = ln.partition(" ")
+            if now - float(ts) < 60:
+                keep.append(ln)
+    except (OSError, ValueError):
+        pass
+    keep.append(f"{now:.2f} {_h(text)}")
+    try:
+        SKIPF.write_text("\n".join(keep) + "\n")
+    except OSError:
+        pass
+
+
+def skip_hit(text):
+    now = time.time()
+    h = _h(text)
+    try:
+        for ln in SKIPF.read_text().splitlines():
+            ts, _, hh = ln.partition(" ")
+            if hh == h and now - float(ts) < 20:
+                return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def clip_snapshot():
+    """Что сейчас в буфере: {"type": mime, "data": bytes} или None (пусто). Текст берём без добавленного перевода строки."""
+    try:
+        r = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=3)
+        types = [x.strip() for x in r.stdout.splitlines() if x.strip()] if r.returncode == 0 else []
+        if not types:
+            return None
+        pick = next((x for x in ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT") if x in types), None)
+        if pick is None:
+            pick = next((x for x in types if x.startswith("text/")), None) or types[0]
+        r = subprocess.run(["wl-paste", "--no-newline", "--type", pick], capture_output=True, timeout=5)
+        if r.returncode != 0 or len(r.stdout) > 30_000_000:
+            return None
+        return {"type": pick, "data": r.stdout}
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def clip_restore(snap):
+    try:
+        if snap is None:
+            subprocess.run(["wl-copy", "--clear"], timeout=3)
+            return
+        if snap["type"].startswith("text/") or snap["type"] in ("UTF8_STRING", "STRING", "TEXT"):
+            try:
+                skip_mark(snap["data"].decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+        subprocess.run(["wl-copy", "--type", snap["type"]], input=snap["data"], timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def deliver(cfg, text, paste, restore=False):
+    """Положить текст в буфер и (если нужно) вставить. restore: после вставки вернуть прежний буфер, а сам текст
+    в историю не писать (для шаблонов)."""
+    prev = False
+    if restore and paste and cfg["templates_restore_clipboard"]:
+        prev = clip_snapshot()
+        skip_mark(text)
+    _deliver(cfg, text, paste)
+    if prev is not False:
+        time.sleep(cfg["templates_restore_ms"] / 1000)
+        clip_restore(prev)
+        log("буфер возвращён: " + ("пуст" if prev is None else prev["type"]))
+
+
+def _deliver(cfg, text, paste):
     """Положить текст в буфер и (если нужно) вставить в активное окно."""
     log(f"deliver: {len(text)} символов, paste={paste}")
     subprocess.run(["wl-copy"], input=text.encode("utf-8"))
@@ -650,6 +740,7 @@ def build_window(cfg, tabs, choose, L=None):
 
     stack = Gtk.Stack()
     lst = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    lst.show()
     stack.add_named(lst, "list")
     box.pack_start(stack, True, True, 0)
     search = Gtk.SearchEntry()
@@ -804,6 +895,7 @@ def build_window(cfg, tabs, choose, L=None):
         m = Gtk.Menu()
         for label, fn in (("Вставить", lambda *_: do_choose(True)),
                           ("Только копировать", lambda *_: do_choose(False)),
+                          ("В шаблоны...", to_tpl),
                           ("Изменить...", start_edit),
                           ("Удалить", delete_sel)):
             it = Gtk.MenuItem(label=label)
@@ -848,15 +940,36 @@ def build_window(cfg, tabs, choose, L=None):
     epage.pack_start(ebar, False, False, 0)
     stack.add_named(epage, "edit")
 
+    # ---- страница «В шаблоны» ----
+    def done_tpl(changed):
+        stack.set_visible_child_name("list")
+        if changed:
+            notify("Сохранено в шаблоны")
+        search.grab_focus()
+
+    tform = TplForm(cfg, Gtk, Gdk, GLib, done_tpl)
+    stack.add_named(tform.box, "tpl")
+    stack.set_visible_child_name("list")
+
+    def to_tpl(*_):
+        t_ = selected_text()
+        if t_ is None:
+            notify("Сначала выберите запись (клик по ней)")
+            return
+        tform.open("new", text=t_)
+        stack.set_visible_child_name("tpl")
+
     # ---- нижняя панель: кнопки и уголок изменения размера ----
     bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     b_paste = Gtk.Button(label="Вставить")
     b_copy = Gtk.Button(label="Копировать")
     b_edit = Gtk.Button(label="Изменить")
     b_del = Gtk.Button(label="Удалить")
-    for b in (b_paste, b_copy, b_edit, b_del):
+    b_tpl = Gtk.Button(label="В шаблоны")
+    for b in (b_paste, b_copy, b_tpl, b_edit, b_del):
         b.set_focus_on_click(False)
         bottom.pack_start(b, False, False, 0)
+    b_tpl.connect("clicked", to_tpl)
     b_paste.connect("clicked", lambda *_: do_choose(True))
     b_copy.connect("clicked", lambda *_: do_choose(False))
     b_edit.connect("clicked", start_edit)
@@ -910,6 +1023,14 @@ def build_window(cfg, tabs, choose, L=None):
     search.connect("activate", on_search_enter)
 
     def on_key(_w, ev):
+        if tform.active:
+            if ev.keyval == Gdk.KEY_Escape:
+                tform.cancel()
+                return True
+            if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and ev.state & Gdk.ModifierType.CONTROL_MASK:
+                tform.save()
+                return True
+            return False
         editing = stack.get_visible_child_name() == "edit"
         if ev.keyval == Gdk.KEY_Escape:
             if editing:
@@ -1053,13 +1174,13 @@ def tpl_scan(root, cfg, _anc=None, all_files=False, skip=()):
     try:
         real = os.path.realpath(root)
     except OSError:
-        return {"dirs": [], "files": []}
+        return {"dirs": [], "files": [], "path": str(root), "allf": all_files}
     anc.add(real)
     dirs, files = [], []
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name.casefold())
     except OSError:
-        return {"dirs": [], "files": []}
+        return {"dirs": [], "files": [], "path": str(root), "allf": all_files}
     for e in entries:
         if e.name.startswith("."):
             continue
@@ -1069,15 +1190,14 @@ def tpl_scan(root, cfg, _anc=None, all_files=False, skip=()):
                 if rp in anc or rp in skip:
                     continue
                 sub = tpl_scan(e.path, cfg, anc, all_files, skip)
-                if sub["dirs"] or sub["files"]:
-                    dirs.append((e.name, sub))
+                dirs.append((e.name, sub))                  # пустые папки тоже показываем: в них можно создавать шаблоны
             elif e.is_file() and tpl_name_ok(e.name, cfg, all_files):
                 if all_files and Path(e.name).suffix.lower().lstrip(".") not in tpl_exts(cfg) and not tpl_is_text(e.path):
                     continue
                 files.append((tpl_display(e.name), e.path, e.stat().st_mtime_ns))
         except OSError:
             continue                                        # битая ссылка и т.п.
-    return {"dirs": dirs, "files": files}
+    return {"dirs": dirs, "files": files, "path": str(root), "allf": all_files}
 
 
 def tpl_extras(cfg):
@@ -1103,9 +1223,8 @@ def tpl_tree(cfg):
         if not os.path.isdir(d) or os.path.realpath(d) == own_real:
             continue
         sub = tpl_scan(d, cfg, all_files=allf, skip=skip)
-        if sub["dirs"] or sub["files"]:
-            names = {n for n, _ in tree["dirs"]}
-            tree["dirs"].append((label if label not in names else label + " (внешняя)", sub))
+        names = {n for n, _ in tree["dirs"]}
+        tree["dirs"].append((label if label not in names else label + " (внешняя)", sub))
     return tree
 
 
@@ -1131,6 +1250,282 @@ def tpl_read(cfg, path):
     if len(data) > int(cfg["templates_max_bytes"]):
         data = data[:int(cfg["templates_max_bytes"])]
     return data.decode("utf-8", "replace").replace("\x00", "")
+
+
+BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def tpl_safe_name(name):
+    """Имя файла/папки: без / \\ : * ? " < > | (Android и Syncthing их не любят), без точки в начале (скрытый файл)."""
+    n = BAD_NAME.sub("_", str(name)).strip().lstrip(".").strip()
+    while len(n.encode("utf-8")) > 180:
+        n = n[:-1]
+    return n
+
+
+def tpl_file_name(name, cfg, allf):
+    """Имя файла нового шаблона: как есть (формат jbak2 - без расширения). Если в имени есть точка, которая выглядит как
+    расширение (v1.2), добавляем .txt, иначе наше окно не посчитает файл шаблоном."""
+    n = tpl_safe_name(name)
+    if n and not allf and not tpl_name_ok(n, cfg, False):
+        n += ".txt"
+    return n
+
+
+def tpl_auto_name(text):
+    for ln in text.splitlines():
+        if ln.strip():
+            return ln.strip()[:40]
+    return "Шаблон"
+
+
+def tpl_allf(cfg, path):
+    """Лежит ли путь в чужой папке (jbak2): там имена без правил расширений."""
+    rp = os.path.realpath(path)
+    for _l, d, allf in tpl_extras(cfg):
+        rd = os.path.realpath(d)
+        if allf and (rp == rd or rp.startswith(rd + os.sep)):
+            return True
+    return False
+
+
+def tpl_dirs(cfg):
+    """Все папки, куда можно класть шаблоны: [(подпись, путь, allf)]. Корень, подпапки любой глубины, чужие папки."""
+    out = []
+    skip = set()
+    if str(cfg["templates_export_dir"]).strip():
+        skip.add(os.path.realpath(os.path.expanduser(cfg["templates_export_dir"])))
+
+    def rec(path, label, allf, anc):
+        out.append((label, str(path), allf))
+        anc = anc | {os.path.realpath(path)}
+        try:
+            entries = sorted(os.scandir(path), key=lambda e: e.name.casefold())
+        except OSError:
+            return
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            try:
+                if not e.is_dir():
+                    continue
+                rp = os.path.realpath(e.path)
+                if rp in anc or rp in skip:
+                    continue
+            except OSError:
+                continue
+            rec(e.path, (label + "/" if label != "(корень шаблонов)" else "") + e.name, allf, anc)
+
+    root = tpl_root(cfg)
+    if root.is_dir():
+        rec(root, "(корень шаблонов)", False, frozenset())
+    own = os.path.realpath(root)
+    for label, d, allf in tpl_extras(cfg):
+        if os.path.isdir(d) and os.path.realpath(d) != own:
+            rec(d, label, allf, frozenset())
+    return out
+
+
+def tpl_write_text(path, text):
+    """Атомарная запись (ссылка на файл сохраняется: пишем в её цель)."""
+    real = os.path.realpath(path)
+    tmp = os.path.join(os.path.dirname(real), ".syncthing." + os.path.basename(real) + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, real)
+
+
+def tpl_remove(path):
+    """Удалить файл, ссылку или папку (ссылка на папку - только сама ссылка, содержимое цели не трогаем)."""
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+
+
+def clip_text():
+    try:
+        r = subprocess.run(["wl-paste", "--no-newline", "--type", "text"], capture_output=True, timeout=3)
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+class TplForm:
+    """Встроенная страница окна: новый шаблон / правка / новая папка / переименование папки (диалоги-окна не годятся:
+    над слоем overlay они бы оказались под ним)."""
+
+    def __init__(self, cfg, Gtk, Gdk, GLib, done):
+        self.cfg, self.Gtk, self.done = cfg, Gtk, done
+        self.mode, self.path, self.allf, self.dirs, self.active = None, None, False, [], False
+        b = self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.title = Gtk.Label()
+        self.title.set_xalign(0)
+        self.title.get_style_context().add_class("osk-head")
+        b.pack_start(self.title, False, False, 0)
+        self.name = Gtk.Entry()
+        self.name.set_placeholder_text("Имя (как в списке)")
+        self.name.connect("activate", self._name_enter)
+        b.pack_start(self.name, False, False, 0)
+        self.frow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.frow.pack_start(Gtk.Label(label="Папка:"), False, False, 0)
+        self.combo = Gtk.ComboBoxText()
+        self.frow.pack_start(self.combo, True, True, 0)
+        b.pack_start(self.frow, False, False, 0)
+        self.newdir = Gtk.Entry()
+        self.newdir.set_placeholder_text("Новая подпапка в выбранной папке (необязательно)")
+        b.pack_start(self.newdir, False, False, 0)
+        self.tv = Gtk.TextView()
+        self.tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.sw = Gtk.ScrolledWindow()
+        self.sw.add(self.tv)
+        b.pack_start(self.sw, True, True, 0)
+        self.msg = Gtk.Label()
+        self.msg.set_xalign(0)
+        self.msg.set_line_wrap(True)
+        b.pack_start(self.msg, False, False, 0)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.b_save = Gtk.Button(label="Сохранить")
+        self.b_cancel = Gtk.Button(label="Отмена")
+        self.b_clip = Gtk.Button(label="Текст из буфера")
+        for x in (self.b_save, self.b_cancel, self.b_clip):
+            x.set_focus_on_click(False)
+            bar.pack_start(x, False, False, 0)
+        self.b_save.connect("clicked", lambda *_: self.save())
+        self.b_cancel.connect("clicked", lambda *_: self.cancel())
+        self.b_clip.connect("clicked", lambda *_: self.tv.get_buffer().set_text(clip_text()))
+        b.pack_start(bar, False, False, 0)
+        b.show_all()
+
+    def _name_enter(self, *_):
+        if self.mode in ("new", "edit"):
+            self.tv.grab_focus()
+        else:
+            self.save()
+
+    def text(self):
+        buf = self.tv.get_buffer()
+        return buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+
+    def open(self, mode, text="", name="", folder=None, path=None, allf=False):
+        self.mode, self.path, self.allf, self.active = mode, path, allf, True
+        self.msg.set_text("")
+        self.name.set_text(name)
+        self.newdir.set_text("")
+        self.tv.get_buffer().set_text(text)
+        titles = {"new": "Новый шаблон", "edit": "Правка шаблона", "mkdir": "Новая папка", "rename_dir": "Переименование папки"}
+        self.title.set_text(titles[mode] + "   (Ctrl+Enter - сохранить, Esc - отмена)")
+        with_folder = mode in ("new", "mkdir")
+        self.frow.set_visible(with_folder)
+        self.newdir.set_visible(mode == "new")
+        self.sw.set_visible(mode in ("new", "edit"))
+        self.b_clip.set_visible(mode in ("new", "edit"))
+        if with_folder:
+            self.dirs = tpl_dirs(self.cfg)
+            self.combo.remove_all()
+            idx = 0
+            fr = os.path.realpath(folder) if folder else None
+            for i, (label, d, _a) in enumerate(self.dirs):
+                self.combo.append_text(label)
+                if fr and os.path.realpath(d) == fr:
+                    idx = i
+            self.combo.set_active(idx)
+        self.name.grab_focus()
+        self.name.set_position(-1)
+
+    def cancel(self):
+        self.active = False
+        self.done(False)
+
+    def _err(self, text):
+        from html import escape
+        self.msg.set_markup('<span foreground="#d33">' + escape(text) + "</span>")
+
+    def save(self):
+        try:
+            changed = self._save()
+        except OSError as e:
+            self._err(f"Не удалось: {e}")
+            return
+        if changed:
+            self.active = False
+            self.done(True)
+
+    def _save(self):
+        cfg, mode = self.cfg, self.mode
+        raw = self.name.get_text().strip()
+        if mode in ("new", "mkdir"):
+            if not self.dirs or self.combo.get_active() < 0:
+                self._err("Нет папки шаблонов")
+                return False
+            _label, dpath, allf = self.dirs[self.combo.get_active()]
+        if mode == "new":
+            text = self.text()
+            if not text.strip():
+                self._err("Пустой текст не сохраняю")
+                return False
+            nd = tpl_safe_name(self.newdir.get_text())
+            if nd:
+                dpath = os.path.join(dpath, nd)
+                os.makedirs(dpath, exist_ok=True)
+            fname = tpl_file_name(raw or tpl_auto_name(text), cfg, allf)
+            if not fname:
+                self._err("Недопустимое имя")
+                return False
+            target = os.path.join(dpath, fname)
+            if os.path.lexists(target):
+                self._err(f"Шаблон «{tpl_display(fname)}» уже есть в этой папке")
+                return False
+            tpl_write_text(target, text)
+            log(f"шаблон создан: {target}")
+            return True
+        if mode == "mkdir":
+            n = tpl_safe_name(raw)
+            if not n:
+                self._err("Введите имя папки")
+                return False
+            target = os.path.join(dpath, n)
+            if os.path.lexists(target):
+                self._err("Такая папка уже есть")
+                return False
+            os.makedirs(target)
+            log(f"папка создана: {target}")
+            return True
+        if mode == "rename_dir":
+            n = tpl_safe_name(raw)
+            if not n:
+                self._err("Введите имя папки")
+                return False
+            target = os.path.join(os.path.dirname(self.path.rstrip(os.sep)), n)
+            if os.path.lexists(target) and os.path.realpath(target) != os.path.realpath(self.path):
+                self._err("Такая папка уже есть")
+                return False
+            if target != self.path:
+                os.rename(self.path, target)
+            return True
+        if mode == "edit":
+            text = self.text()
+            if not text.strip():
+                self._err("Пустой текст не сохраняю. Чтобы убрать шаблон, нажмите «Удалить»")
+                return False
+            target = self.path
+            if not raw:
+                self._err("Недопустимое имя")
+                return False
+            if raw != tpl_display(os.path.basename(self.path)):          # имя поменяли - переименуем файл
+                fname = tpl_file_name(raw, cfg, self.allf)
+                if not fname:
+                    self._err("Недопустимое имя")
+                    return False
+                target = os.path.join(os.path.dirname(self.path), fname)
+                if os.path.lexists(target):
+                    self._err(f"Шаблон «{tpl_display(fname)}» уже есть в этой папке")
+                    return False
+            tpl_write_text(self.path, text)
+            if target != self.path:
+                os.rename(self.path, target)
+            return True
+        return False
 
 
 def build_tpl_window(cfg, L, root, choose, default_action):
@@ -1232,19 +1627,25 @@ def build_tpl_window(cfg, L, root, choose, default_action):
         handle.connect("motion-notify-event", h_motion)
         handle.connect("button-release-event", h_release)
 
+    stack = Gtk.Stack()
+    lst = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    lst.show()
+    stack.add_named(lst, "list")
+    box.pack_start(stack, True, True, 0)
     search = Gtk.SearchEntry()
     search.set_placeholder_text("Поиск по всем шаблонам (по имени и тексту)...")
-    box.pack_start(search, False, False, 0)
+    lst.pack_start(search, False, False, 0)
     pathlab = Gtk.Label()
     pathlab.set_xalign(0)
     pathlab.get_style_context().add_class("osk-path")
-    box.pack_start(pathlab, False, False, 0)
+    lst.pack_start(pathlab, False, False, 0)
     lb = Gtk.ListBox()
     lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
     lb.set_activate_on_single_click(False)
+    lb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
     sw = Gtk.ScrolledWindow()
     sw.add(lb)
-    box.pack_start(sw, True, True, 0)
+    lst.pack_start(sw, True, True, 0)
 
     st = {"tree": tpl_tree(cfg), "path": [], "q": "", "cache": {}}
     st["sig"] = tpl_sig(st["tree"])
@@ -1316,12 +1717,12 @@ def build_tpl_window(cfg, L, root, choose, default_action):
                 lb.add(mk_row("up", "⬑  .. (назад)"))
             for name, sub in node["dirs"]:
                 cnt = sum(1 for _ in tpl_walk(sub))
-                lb.add(mk_row("dir", "\U0001F4C1  " + name, f"шаблонов: {cnt}", dir=name))
+                lb.add(mk_row("dir", "\U0001F4C1  " + name, f"шаблонов: {cnt}", dir=name, dpath=sub["path"], cnt=cnt))
             for name, path, _mt in node["files"]:
                 lb.add(mk_row("file", name, short_text(text_of(path), n_rows), path=path))
             if not node["dirs"] and not node["files"]:
                 lb.add(mk_row("none", "Здесь пока нет шаблонов",
-                              f"Положите файлы .txt (или без расширения) в папку:\n{root}"))
+                              f"Нажмите «＋ Шаблон» или «＋ Из буфера».\nПапка шаблонов: {root}"))
         lb.show_all()
         first = next((r for r in lb.get_children() if r.kind in ("file", "dir")), None)
         if first is not None:
@@ -1349,6 +1750,129 @@ def build_tpl_window(cfg, L, root, choose, default_action):
             return
         activate(row, action)
 
+    # ---- создание, правка, удаление ----
+    form = TplForm(cfg, Gtk, Gdk, GLib, lambda changed: done_form(changed))
+    stack.add_named(form.box, "form")
+    stack.set_visible_child_name("list")
+    del_state = {"row": None}
+
+    def done_form(changed):
+        stack.set_visible_child_name("list")
+        if changed:
+            reload()
+        search.grab_focus()
+
+    def reload():
+        new = tpl_tree(cfg)
+        st["tree"], st["sig"] = new, tpl_sig(new)
+        populate()
+
+    def protected(dpath):
+        rp = os.path.realpath(dpath)
+        roots = [os.path.realpath(root)] + [os.path.realpath(d) for _l, d, _a in tpl_extras(cfg)]
+        return rp in roots
+
+    def show_form():
+        stack.set_visible_child_name("form")
+
+    def new_tpl(text=""):
+        n = node_here()
+        form.open("new", text=text, folder=n["path"], allf=n.get("allf", False))
+        show_form()
+
+    def new_from_clip(*_):
+        txt = clip_text()
+        if not txt.strip():
+            notify("В буфере обмена нет текста")
+            return
+        new_tpl(txt)
+
+    def new_dir(*_):
+        form.open("mkdir", folder=node_here()["path"])
+        show_form()
+
+    def edit_sel(*_):
+        row = selected()
+        if row is None or row.kind not in ("file", "dir"):
+            notify("Сначала выберите шаблон или папку (клик по ним)")
+            return
+        if row.kind == "file":
+            try:
+                big = os.path.getsize(row.path) > int(cfg["templates_max_bytes"])
+            except OSError:
+                big = False
+            if big:
+                notify("Файл слишком большой для правки здесь (templates_max_bytes)")
+                return
+            form.open("edit", text=tpl_read(cfg, row.path), name=tpl_display(os.path.basename(row.path)),
+                      path=row.path, allf=tpl_allf(cfg, row.path))
+        else:
+            if protected(row.dpath):
+                notify("Корневую папку шаблонов переименовать нельзя")
+                return
+            form.open("rename_dir", name=os.path.basename(row.dpath.rstrip(os.sep)), path=row.dpath)
+        show_form()
+
+    def delete_sel(*_):
+        row = selected()
+        if row is None or row.kind not in ("file", "dir"):
+            notify("Сначала выберите шаблон или папку (клик по ним)")
+            return
+        if row.kind == "dir" and protected(row.dpath):
+            notify("Корневую папку шаблонов удалить нельзя")
+            return
+        if del_state["row"] is row:                         # второе нажатие - подтверждение
+            del_state["row"] = None
+            b_del.set_label("Удалить")
+            try:
+                tpl_remove(row.path if row.kind == "file" else row.dpath)
+                log("удалено: " + (row.path if row.kind == "file" else row.dpath))
+            except OSError as e:
+                notify(f"Не удалось удалить: {e}")
+            reload()
+            return
+        del_state["row"] = row
+        b_del.set_label("Точно удалить?" if row.kind == "file" else f"Удалить папку и {row.cnt} шабл.?")
+
+        def disarm():
+            if del_state["row"] is row:
+                del_state["row"] = None
+                b_del.set_label("Удалить")
+            return False
+
+        GLib.timeout_add(3000, disarm)
+
+    def on_lb_press(lbw, ev):
+        if ev.button != 3:
+            return False
+        row = lbw.get_row_at_y(int(ev.y))
+        m = Gtk.Menu()
+        items = []
+        if row is not None and row.kind in ("file", "dir"):
+            lbw.select_row(row)
+            if row.kind == "file":
+                items += [("Вставить", lambda *_: activate(row, "paste")),
+                          ("Только копировать", lambda *_: activate(row, "copy")),
+                          ("Изменить...", edit_sel), ("Удалить", delete_sel)]
+            else:
+                items += [("Открыть папку", lambda *_: activate(row, default_action)),
+                          ("Переименовать...", edit_sel), ("Удалить папку", delete_sel)]
+            items.append(None)
+        items += [("＋ Новый шаблон...", lambda *_: new_tpl()), ("＋ Шаблон из буфера...", new_from_clip),
+                  ("＋ Новая папка...", new_dir)]
+        for it in items:
+            if it is None:
+                m.append(Gtk.SeparatorMenuItem())
+                continue
+            mi = Gtk.MenuItem(label=it[0])
+            mi.connect("activate", it[1])
+            m.append(mi)
+        m.show_all()
+        m.popup_at_pointer(ev)
+        return True
+
+    lb.connect("button-press-event", on_lb_press)
+
     def on_search(entry):
         st["q"] = entry.get_text().lower().strip()
         populate()
@@ -1361,14 +1885,28 @@ def build_tpl_window(cfg, L, root, choose, default_action):
     search.connect("search-changed", on_search)
     search.connect("activate", on_search_enter)
 
+    bottom1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
     b_paste = Gtk.Button(label="Вставить")
     b_copy = Gtk.Button(label="Копировать")
-    for b in (b_paste, b_copy):
+    b_edit = Gtk.Button(label="Изменить")
+    b_del = Gtk.Button(label="Удалить")
+    b_new = Gtk.Button(label="＋ Шаблон")
+    b_clip = Gtk.Button(label="＋ Из буфера")
+    b_dir = Gtk.Button(label="＋ Папка")
+    for b in (b_paste, b_copy, b_edit, b_del):
+        b.set_focus_on_click(False)
+        bottom1.pack_start(b, False, False, 0)
+    for b in (b_new, b_clip, b_dir):
         b.set_focus_on_click(False)
         bottom.pack_start(b, False, False, 0)
     b_paste.connect("clicked", lambda *_: do_btn("paste"))
     b_copy.connect("clicked", lambda *_: do_btn("copy"))
+    b_edit.connect("clicked", edit_sel)
+    b_del.connect("clicked", delete_sel)
+    b_new.connect("clicked", lambda *_: new_tpl())
+    b_clip.connect("clicked", new_from_clip)
+    b_dir.connect("clicked", new_dir)
     if layer:
         grip_box = Gtk.EventBox()
         grip_box.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
@@ -1400,7 +1938,8 @@ def build_tpl_window(cfg, L, root, choose, default_action):
         grip_box.connect("button-press-event", g_press)
         grip_box.connect("motion-notify-event", g_motion)
         grip_box.connect("button-release-event", g_release)
-    box.pack_start(bottom, False, False, 0)
+    lst.pack_start(bottom1, False, False, 0)
+    lst.pack_start(bottom, False, False, 0)
 
     def refresh():
         """Файлы шаблонов поменялись (Syncthing, редактор) - перечитываем."""
@@ -1415,6 +1954,17 @@ def build_tpl_window(cfg, L, root, choose, default_action):
     GLib.timeout_add(2000, refresh)
 
     def on_key(_w, ev):
+        if form.active:
+            if ev.keyval == Gdk.KEY_Escape:
+                form.cancel()
+                return True
+            if ev.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and ev.state & Gdk.ModifierType.CONTROL_MASK:
+                form.save()
+                return True
+            return False
+        if ev.keyval == Gdk.KEY_Delete and not search.has_focus():
+            delete_sel()
+            return True
         if ev.keyval == Gdk.KEY_Escape:
             if st["q"]:
                 search.set_text("")
@@ -1486,7 +2036,7 @@ def cmd_tpl(cfg, a):
         text = text.rstrip("\r\n")                     # хвостовой перевод строки при вставке в терминал выполнил бы команду
     paste = chosen["action"] == "paste"
     log(f"шаблон: {len(text)} символов, действие {chosen['action']}")
-    deliver(cfg, text, paste)
+    deliver(cfg, text, paste, restore=True)
     if not paste:
         notify("Шаблон скопирован в буфер обмена")
 
