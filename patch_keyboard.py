@@ -381,6 +381,472 @@ def patch_sync(c, m):
     return c, m, True
 
 
+# ---------------- плавающая клавиатура (osk-patch: float) ----------------
+RELPTR_XML = r'''<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="relative_pointer_unstable_v1">
+
+  <copyright>
+    Copyright © 2014      Jonas Ådahl
+    Copyright © 2015      Red Hat Inc.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="protocol for relative pointer motion events">
+    This protocol specifies a set of interfaces used for making clients able to
+    receive relative pointer events not obstructed by barriers (such as the
+    monitor edge or other pointer barriers).
+
+    To start receiving relative pointer events, a client must first bind the
+    global interface "wp_relative_pointer_manager" which, if a compositor
+    supports relative pointer motion events, is exposed by the registry. After
+    having created the relative pointer manager proxy object, the client uses
+    it to create the actual relative pointer object using the
+    "get_relative_pointer" request given a wl_pointer. The relative pointer
+    motion events will then, when applicable, be transmitted via the proxy of
+    the newly created relative pointer object. See the documentation of the
+    relative pointer interface for more details.
+
+    Warning! The protocol described in this file is experimental and backward
+    incompatible changes may be made. Backward compatible changes may be added
+    together with the corresponding interface version bump. Backward
+    incompatible changes are done by bumping the version number in the protocol
+    and interface names and resetting the interface version. Once the protocol
+    is to be declared stable, the 'z' prefix and the version number in the
+    protocol and interface names are removed and the interface version number is
+    reset.
+  </description>
+
+  <interface name="zwp_relative_pointer_manager_v1" version="1">
+    <description summary="get relative pointer objects">
+      A global interface used for getting the relative pointer object for a
+      given pointer.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the relative pointer manager object">
+	Used by the client to notify the server that it will no longer use this
+	relative pointer manager object.
+      </description>
+    </request>
+
+    <request name="get_relative_pointer">
+      <description summary="get a relative pointer object">
+	Create a relative pointer interface given a wl_pointer object. See the
+	wp_relative_pointer interface for more details.
+      </description>
+      <arg name="id" type="new_id" interface="zwp_relative_pointer_v1"/>
+      <arg name="pointer" type="object" interface="wl_pointer"/>
+    </request>
+  </interface>
+
+  <interface name="zwp_relative_pointer_v1" version="1">
+    <description summary="relative pointer object">
+      A wp_relative_pointer object is an extension to the wl_pointer interface
+      used for emitting relative pointer events. It shares the same focus as
+      wl_pointer objects of the same seat and will only emit events when it has
+      focus.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="release the relative pointer object"/>
+    </request>
+
+    <event name="relative_motion">
+      <description summary="relative pointer motion">
+	Relative x/y pointer motion from the pointer of the seat associated with
+	this object.
+
+	A relative motion is in the same dimension as regular wl_pointer motion
+	events, except they do not represent an absolute position. For example,
+	moving a pointer from (x, y) to (x', y') would have the equivalent
+	relative motion (x' - x, y' - y). If a pointer motion caused the
+	absolute pointer position to be clipped by for example the edge of the
+	monitor, the relative motion is unaffected by the clipping and will
+	represent the unclipped motion.
+
+	This event also contains non-accelerated motion deltas. The
+	non-accelerated delta is, when applicable, the regular pointer motion
+	delta as it was before having applied motion acceleration and other
+	transformations such as normalization.
+
+	Note that the non-accelerated delta does not represent 'raw' events as
+	they were read from some device. Pointer motion acceleration is device-
+	and configuration-specific and non-accelerated deltas and accelerated
+	deltas may have the same value on some devices.
+
+	Relative motions are not coupled to wl_pointer.motion events, and can be
+	sent in combination with such events, but also independently. There may
+	also be scenarios where wl_pointer.motion is sent, but there is no
+	relative motion. The order of an absolute and relative motion event
+	originating from the same physical motion is not guaranteed.
+
+	If the client needs button events or focus state, it can receive them
+	from a wl_pointer object of the same seat that the wp_relative_pointer
+	object is associated with.
+      </description>
+      <arg name="utime_hi" type="uint"
+	   summary="high 32 bits of a 64 bit timestamp with microsecond granularity"/>
+      <arg name="utime_lo" type="uint"
+	   summary="low 32 bits of a 64 bit timestamp with microsecond granularity"/>
+      <arg name="dx" type="fixed"
+	   summary="the x component of the motion vector"/>
+      <arg name="dy" type="fixed"
+	   summary="the y component of the motion vector"/>
+      <arg name="dx_unaccel" type="fixed"
+	   summary="the x component of the unaccelerated motion vector"/>
+      <arg name="dy_unaccel" type="fixed"
+	   summary="the y component of the unaccelerated motion vector"/>
+    </event>
+  </interface>
+
+</protocol>
+'''
+
+M_FLOAT = "/* osk-patch: float */"
+M_TAP = "/* osk-patch: tap-cmd */"
+
+FLOAT_MAIN_FUNCS = M_FLOAT + r'''
+/* Плавающий режим: клавиатура - небольшая поверхность в углу (якорь top+left, поля = позиция), пропорционально
+   уменьшенная (fl_scale); круглая кнопка в левом верхнем углу: клик - свернуть в саму кнопку / развернуть,
+   перетаскивание - двигать. Позицию и состояние сообщаем команде $OSK_FLOAT_CMD (<что> <a> <b>).
+   Перетаскивание мышью идёт по относительным смещениям (zwp_relative_pointer): координаты внутри поверхности
+   при движении самой поверхности у композитора «плывут». Без этого протокола (и для касаний) поверхность
+   переносится один раз, при отпускании. */
+static int fl_on = 0, fl_collapsed = 0, fl_x = 24, fl_y = 24;
+static double fl_scale = 0.5;
+static uint32_t fl_btn = 40;
+static int fl_drag = 0, fl_moved = 0, fl_lx0 = 0, fl_ly0 = 0, fl_wait = 0;
+static int fl_sx = 0, fl_sy = 0, fl_lastx = 0, fl_lasty = 0, fl_relmode = 0;
+static double fl_accx = 0, fl_accy = 0;
+static struct zwp_relative_pointer_manager_v1 *fl_rel_mgr;
+static struct zwp_relative_pointer_v1 *fl_rel_ptr;
+
+static void
+osk_fl_cmd(const char *what, int a, int b)
+{
+    const char *base = getenv("OSK_FLOAT_CMD");
+    char cmd[1024];
+    if (!base || !*base)
+        return;
+    snprintf(cmd, sizeof cmd, "%s %s %d %d", base, what, a, b);
+    if (fork() == 0) {
+        sigset_t all;
+        setsid();
+        sigfillset(&all);
+        sigprocmask(SIG_UNBLOCK, &all, NULL);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+}
+
+static void
+osk_fl_clamp(int *x, int *y)
+{
+    int mx = (int)available_width - (int)keyboard.w;
+    int my = (int)available_height - (int)keyboard.h;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if (*x > mx) *x = mx;
+    if (*y > my) *y = my;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+}
+
+static void osk_fl_flush(int force);
+
+static void
+osk_fl_sync_done(void *data, struct wl_callback *cb, uint32_t t)
+{
+    fl_wait = 0;
+    wl_callback_destroy(cb);
+    if (fl_drag && fl_relmode)
+        osk_fl_flush(0);
+}
+
+static const struct wl_callback_listener osk_fl_sync_listener = {
+    .done = osk_fl_sync_done,
+};
+
+/* применить накопленное смещение: поля поверхности = старт + смещение (с ограничением по экрану) */
+static void
+osk_fl_flush(int force)
+{
+    int nx = fl_sx + (int)(fl_accx + (fl_accx < 0 ? -0.5 : 0.5));
+    int ny = fl_sy + (int)(fl_accy + (fl_accy < 0 ? -0.5 : 0.5));
+    if (!layer_surface || (fl_wait && !force))
+        return;
+    osk_fl_clamp(&nx, &ny);
+    fl_accx = nx - fl_sx;                 /* у края накопление останавливается: обратное движение сразу двигает окно */
+    fl_accy = ny - fl_sy;
+    if (nx == fl_x && ny == fl_y)
+        return;
+    fl_x = nx;
+    fl_y = ny;
+    zwlr_layer_surface_v1_set_margin(layer_surface, fl_y, 0, 0, fl_x);
+    wl_surface_commit(draw_surf.surf);
+    if (!force) {                         /* пока композитор не применил позицию, новую не шлём */
+        fl_wait = 1;
+        wl_callback_add_listener(wl_display_sync(display), &osk_fl_sync_listener, NULL);
+    }
+}
+
+static void
+osk_fl_rel_motion(void *data, struct zwp_relative_pointer_v1 *rp, uint32_t hi, uint32_t lo,
+                  wl_fixed_t dx, wl_fixed_t dy, wl_fixed_t dxu, wl_fixed_t dyu)
+{
+    if (!fl_drag || !fl_relmode)
+        return;
+    fl_accx += wl_fixed_to_double(dx);
+    fl_accy += wl_fixed_to_double(dy);
+    if (!fl_moved) {
+        if (fl_accx * fl_accx + fl_accy * fl_accy < 64.0)
+            return;
+        fl_moved = 1;
+    }
+    osk_fl_flush(0);
+}
+
+static const struct zwp_relative_pointer_v1_listener osk_fl_rel_listener = {
+    .relative_motion = osk_fl_rel_motion,
+};
+
+static int
+osk_fl_press(int x, int y, int via_pointer)
+{
+    struct key *k;
+    if (!fl_on)
+        return 0;
+    if (!fl_collapsed) {
+        k = kbd_get_key(&keyboard, x, y);
+        if (!k || k->type != FloatBtn)
+            return 0;
+    }
+    if (via_pointer && fl_rel_mgr && pointer && !fl_rel_ptr) {
+        fl_rel_ptr = zwp_relative_pointer_manager_v1_get_relative_pointer(fl_rel_mgr, pointer);
+        zwp_relative_pointer_v1_add_listener(fl_rel_ptr, &osk_fl_rel_listener, NULL);
+    }
+    fl_relmode = via_pointer && fl_rel_ptr != NULL;
+    fl_drag = 1;
+    fl_moved = 0;
+    fl_lx0 = fl_lastx = x;
+    fl_ly0 = fl_lasty = y;
+    fl_sx = fl_x;
+    fl_sy = fl_y;
+    fl_accx = fl_accy = 0;
+    fl_wait = 0;
+    return 1;
+}
+
+/* координаты внутри поверхности: нужны для касаний и когда нет relative-pointer (поверхность не двигается до отпускания) */
+static void
+osk_fl_motion(int x, int y)
+{
+    if (!fl_drag || fl_relmode)
+        return;
+    fl_lastx = x;
+    fl_lasty = y;
+    if (!fl_moved && abs(x - fl_lx0) + abs(y - fl_ly0) >= 8)
+        fl_moved = 1;
+}
+
+static void
+osk_fl_release(void)
+{
+    if (!fl_drag)
+        return;
+    fl_drag = 0;
+    if (fl_moved) {
+        if (!fl_relmode) {
+            fl_accx = fl_lastx - fl_lx0;
+            fl_accy = fl_lasty - fl_ly0;
+        }
+        osk_fl_flush(1);
+        osk_fl_cmd("pos", fl_x, fl_y);
+    } else {
+        fl_collapsed = !fl_collapsed;
+        osk_fl_cmd(fl_collapsed ? "collapsed" : "expanded", fl_x, fl_y);
+        hide();
+        show();
+    }
+}
+
+'''
+
+FLOAT_REDIM = M_FLOAT + r'''
+    keyboard.osk_fl = 0;
+    if (fl_on) {
+        if (fl_collapsed) {
+            keyboard.w = height = fl_btn;
+            keyboard.osk_fl = 2;
+        } else {
+            uint32_t fh = (uint32_t)((double)height * fl_scale);
+            keyboard.w = (uint32_t)((double)available_width * fl_scale);
+            height = fh < 90 ? 90 : fh;
+            keyboard.osk_fl = 1;
+        }
+    }
+'''
+
+FLOAT_SHOW = M_FLOAT + r'''
+    if (fl_on) {
+        osk_fl_clamp(&fl_x, &fl_y);
+        zwlr_layer_surface_v1_set_anchor(layer_surface,
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+        zwlr_layer_surface_v1_set_size(layer_surface, keyboard.w, height);
+        zwlr_layer_surface_v1_set_margin(layer_surface, fl_y, 0, 0, fl_x);
+        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, 0);
+    }
+'''
+
+FLOAT_ARGS = M_FLOAT + r'''
+        } else if (!strcmp(argv[i], "--float")) {
+            /* --float X,Y[,свёрнута]: плавающий режим, позиция (поля от левого верхнего угла) и состояние */
+            int fx = 24, fy = 24, fc = 0;
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            sscanf(argv[++i], "%d,%d,%d", &fx, &fy, &fc);
+            fl_on = 1;
+            fl_x = fx < 0 ? 0 : fx;
+            fl_y = fy < 0 ? 0 : fy;
+            fl_collapsed = fc ? 1 : 0;
+        } else if (!strcmp(argv[i], "--float-scale")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            fl_scale = atof(argv[++i]);
+            if (fl_scale < 0.2) fl_scale = 0.2;
+            if (fl_scale > 1.0) fl_scale = 1.0;
+        } else if (!strcmp(argv[i], "--float-button")) {
+            if (i >= argc - 1) {
+                usage(argv[0]);
+                exit(1);
+            }
+            fl_btn = (uint32_t)atoi(argv[++i]);
+            if (fl_btn < 24) fl_btn = 24;
+            if (fl_btn > 120) fl_btn = 120;
+'''
+
+FLOAT_DRAW_FUNC = M_FLOAT + r'''
+static void
+osk_draw_fbtn(struct kbd *kb, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t d = w < h ? w : h, d2;
+    Color amber = {.bgra = {0x20, 0xA0, 0xE0, 0xFF}};
+    Color dark = {.bgra = {0x28, 0x28, 0x28, 0xFF}};
+    if (d > 8)
+        d -= 4;
+    x += (w - d) / 2;
+    y += (h - d) / 2;
+    drw_fill_rectangle(kb->surf, amber, x, y, d, d, (int)(d / 2));
+    d2 = d / 3;
+    if (d2 > 1)
+        drw_fill_rectangle(kb->surf, dark, x + (d - d2) / 2, y + (d - d2) / 2, d2, d2, (int)(d2 / 2));
+}
+
+'''
+
+
+def patch_float(c, h, m):
+    """Плавающий режим: main.c, keyboard.c, keyboard.h. Требует патчи mod-lock+hold и layout-sync."""
+    if M_FLOAT in m and M_FLOAT in c:
+        return c, h, m, False
+    if M_SYNC not in m:
+        raise ValueError("«float»: сначала должен примениться патч layout-sync")
+    px = Path("proto/relative-pointer-unstable-v1.xml")      # протокол относительного указателя (для перетаскивания)
+    if not px.exists():
+        px.write_text(RELPTR_XML, encoding="utf-8")
+    # --- keyboard.h ---
+    h = sub1(h, r"(\n\tEndRow,)", lambda mm: "\n\tFloatBtn,  // osk: круглая кнопка плавающего режима" + mm.group(1),
+             "enum key_type", hint="EndRow")
+    h = sub1(h, r"(struct kbd \{\n)", lambda mm: mm.group(1) +
+             "\tint osk_fl;  /* osk: 0 - обычный режим, 1 - плавающая, 2 - свёрнута в кнопку */\n",
+             "struct kbd (float)", hint="struct kbd")
+    # --- keyboard.c ---
+    c = sub1(c, r"(\nvoid\nkbd_draw_key\(struct kbd \*kb, struct key \*k, enum key_draw_type type\)\n\{)",
+             lambda mm: "\n" + FLOAT_DRAW_FUNC + mm.group(1), "kbd_draw_key", hint="kbd_draw_key")
+    c = sub1(c, r"(    struct clr_scheme \*scheme = &kb->schemes\[k->scheme\];\n)",
+             lambda mm: mm.group(1) + "    if (k->type == FloatBtn) {          " + M_FLOAT + "\n"
+             "        osk_draw_fbtn(kb, k->x, k->y, k->w, k->h);\n        return;\n    }\n",
+             "scheme в kbd_draw_key", hint="struct clr_scheme *scheme")
+    c = sub1(c, r"(    struct drwsurf \*d = kb->surf;\n    struct key \*next_key = kb->layout->keys;\n)",
+             lambda mm: mm.group(1) + "    if (kb->osk_fl == 2) {              " + M_FLOAT + "\n"
+             "        drw_do_clear(d, 0, 0, kb->w, kb->h);\n        osk_draw_fbtn(kb, 0, 0, kb->w, kb->h);\n        return;\n    }\n",
+             "kbd_draw_layout", hint="kbd_draw_layout")
+    c = sub1(c, r"(kbd_press_key\(struct kbd \*kb, struct key \*k, uint32_t time\)\n\{\n)",
+             lambda mm: mm.group(1) + "    if (k->type == FloatBtn)\n        return;\n", "kbd_press_key (float)", hint="kbd_press_key")
+    # --- main.c ---
+    m = sub1(m, r"(#include \"proto/input-method-unstable-v2-protocol.h\"\n)",
+             lambda mm: mm.group(1) + "#include \"proto/relative-pointer-unstable-v1-client-protocol.h\"   " + M_FLOAT + "\n",
+             "include relative-pointer", hint="input-method-unstable-v2-protocol.h")
+    m = sub1(m, r"(    \} else if \(im_auto && strcmp\(interface, zwp_input_method_manager_v2_interface\.name\) == 0\) \{)",
+             lambda mm: "    } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {   " + M_FLOAT + "\n"
+             "        fl_rel_mgr = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1);\n" + mm.group(1),
+             "handle_global", hint="im_auto")
+    m = sub1(m, r"(\nvoid\nwl_touch_down\()", lambda mm: "\n" + FLOAT_MAIN_FUNCS + mm.group(1), "wl_touch_down", hint="wl_touch_down")
+    m = sub1(m, r"(    touch_x = wl_fixed_to_int\(x\);\n    touch_y = wl_fixed_to_int\(y\);\n\n    kbd_unpress_key\(&keyboard, time\);\n)",
+             lambda mm: "    touch_x = wl_fixed_to_int(x);\n    touch_y = wl_fixed_to_int(y);\n"
+             "    if (osk_fl_press((int)touch_x, (int)touch_y, 0))          " + M_FLOAT + "\n        return;\n\n"
+             "    kbd_unpress_key(&keyboard, time);\n", "touch_down", hint="touch_x")
+    m = sub1(m, r"(    kbd_release_key\(&keyboard, time\);\n\}\n\nvoid\nwl_touch_motion)",
+             lambda mm: "    if (fl_drag) {                          " + M_FLOAT + "\n        osk_fl_release();\n        return;\n    }\n" + mm.group(1),
+             "touch_up", hint="wl_touch_motion")
+    m = sub1(m, r"(    kbd_motion_key\(&keyboard, time, touch_x, touch_y\);\n)",
+             lambda mm: "    if (fl_drag) {                          " + M_FLOAT + "\n        osk_fl_motion((int)touch_x, (int)touch_y);\n        return;\n    }\n" + mm.group(1),
+             "touch_motion", hint="kbd_motion_key")
+    m = sub1(m, r"(    cur_y = wl_fixed_to_int\(surface_y\);\n\n)(    if \(cur_press\) \{\n        kbd_motion_key)",
+             lambda mm: mm.group(1) + "    if (fl_drag) {                          " + M_FLOAT + "\n        osk_fl_motion(cur_x, cur_y);\n        return;\n    }\n" + mm.group(2),
+             "pointer_motion", hint="cur_press")
+    m = sub1(m, r"(    cur_press = state == WL_POINTER_BUTTON_STATE_PRESSED;\n)",
+             lambda mm: mm.group(1) + "    if (fl_on) {                            " + M_FLOAT + "\n"
+             "        if (cur_press && cur_x >= 0 && cur_y >= 0 && osk_fl_press(cur_x, cur_y, 1))\n            return;\n"
+             "        if (!cur_press && fl_drag) {\n            osk_fl_release();\n            return;\n        }\n    }\n",
+             "pointer_button", hint="cur_press =")
+    m = sub1(m, r"(    keyboard\.h = height;\n)", lambda mm: FLOAT_REDIM + mm.group(1), "redimension", hint="keyboard.h = height")
+    m = sub1(m, r"(    zwlr_layer_surface_v1_set_anchor\(layer_surface, anchor\);\n    if \(keyboard\.exclusive\) \{\n"
+                r"        zwlr_layer_surface_v1_set_exclusive_zone\(layer_surface, height\);\n    \}\n)",
+             lambda mm: mm.group(1) + FLOAT_SHOW, "show()", hint="set_exclusive_zone")
+    m = sub1(m, r"(        \} else \{\n            fprintf\(stderr, \"Invalid argument)",
+             lambda mm: FLOAT_ARGS + mm.group(1), "разбор аргументов", hint="Invalid argument")
+    return c, h, m, True
+
+
+def patch_tap(c, h):
+    """Клавиша с командой на короткое нажатие (tap_cmd): Menu открывает наше меню, удержание - настоящий Menu."""
+    if M_TAP in c:
+        return c, h, False
+    if M_LOCK not in c:
+        raise ValueError("«tap-cmd»: сначала должен примениться патч mod-lock+hold")
+    h = sub1(h, r"([ \t]+)(const char \*hold_cmd;[^\n]*\n)",
+             lambda mm: mm.group(1) + mm.group(2) + mm.group(1) + "const char *tap_cmd;     /* osk: команда оболочки на короткое нажатие */\n",
+             "struct key (tap_cmd)", hint="hold_cmd")
+    c = sub1(c, r"if \(k->hold_code \|\| k->hold_cmd\) \{",
+             "if (k->hold_code || k->hold_cmd || k->tap_cmd) {", "HOLD_HOOK", hint="hold_cmd")
+    c = sub1(c, r"(    else if \(held && k->hold_code\)\n        osk_send_combo\(kb, time, k->hold_mod, k->hold_code\);\n)",
+             lambda mm: mm.group(1) + "    else if (!held && k->tap_cmd)               " + M_TAP + "\n        osk_run(k->tap_cmd);\n",
+             "osk_fire_hold", hint="osk_send_combo")
+    return c, h, True
+
 def main():
     if not KC.exists() or not KH.exists() or not KM.exists():
         sys.exit("patch_keyboard: нет keyboard.c/keyboard.h/main.c, запускай из каталога wvkbd")
@@ -389,9 +855,11 @@ def main():
         c, ch_caps = patch_caps(c)
         c, h, ch_lock = patch_lock(c, h)
         c, m, ch_sync = patch_sync(c, m)
+        c, h, ch_tap = patch_tap(c, h)
+        c, h, m, ch_float = patch_float(c, h, m)
     except ValueError as e:
         sys.exit(f"patch_keyboard: {e}\nФайлы не изменены. Версия wvkbd отличается - пришли соответствующий кусок кода.")
-    if not (ch_caps or ch_lock or ch_sync):
+    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float):
         print("patch_keyboard: все правки уже применены")
         return
     for f in (KC, KH, KM):
@@ -400,7 +868,7 @@ def main():
     KC.write_text(c, encoding="utf-8")
     KH.write_text(h, encoding="utf-8")
     KM.write_text(m, encoding="utf-8")
-    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync)) if ok]
+    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("float", ch_float)) if ok]
     print("patch_keyboard: применено: " + ", ".join(done))
 
 

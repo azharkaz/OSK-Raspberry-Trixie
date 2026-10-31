@@ -16,7 +16,8 @@
     >ru:1.25     кнопка переключения на раскладку ru
     й=Q          своя метка, код клавиши после "=" (KEY_ добавляется сам)
     (в [keys] у клавиши можно задать mod = "Ctrl" - комбинация, напр. Ctrl+C;
-     hold_code/hold_mod/hold_cmd - что делать при удержании клавиши)
+     hold_code/hold_mod/hold_cmd - что делать при удержании клавиши, tap_cmd - команда на короткое нажатие)
+    FBtn:1       круглая кнопка плавающего режима (клик - свернуть/развернуть, перетаскивание - двигать)
     4/;=4        метка/метка на shift = код
 """
 import re
@@ -95,6 +96,8 @@ def parse_token(tok, keys):
     body, w = m.group(1), float(m.group(2) or 1.0)
     if body == "_":
         return {"type": "Pad", "w": w, "l": "", "s": "", "scheme": 1}
+    if body == "FBtn":                            # круглая кнопка плавающего режима (нужен патч float)
+        return {"type": "FloatBtn", "w": w, "l": "", "s": "", "scheme": 1}
     if body.startswith(">"):
         return {"type": "Layout", "w": w, "target": body[1:], "scheme": 0}
     if "=" in body:
@@ -123,6 +126,8 @@ def emit_key(k, name, spec_layouts):
     t = k["type"]
     if t == "Pad":
         return f'  {{"", "", {w}, Pad{sch}}},'
+    if t == "FloatBtn":
+        return f'  {{"", "", {w}, FloatBtn, 0}},'
     if t == "Layout":
         tgt = k["target"]
         if tgt not in spec_layouts:
@@ -138,6 +143,8 @@ def emit_key(k, name, spec_layouts):
             hold += f", .hold_mod = {k['hold_mod']}"
         if k.get("hold_cmd"):
             hold += f", .hold_cmd = {cstr(k['hold_cmd'])}"
+        if k.get("tap_cmd"):                       # команда на короткое нажатие (нужен патч tap-cmd)
+            hold += f", .tap_cmd = {cstr(k['tap_cmd'])}"
     return f"  {{{cstr(k['l'])}, {cstr(k['s'])}, {w}, {t}, {k['code']}{mod}{sch}{hold}}},"
 
 

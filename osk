@@ -15,9 +15,14 @@
   osk start --hidden           запустить клавиатуру свёрнутой (независимо от start_hidden в конфиге)
   osk slot                     для xfce4-panel (плагин «Генератор монитора»): пустое место под значок раскладки
   osk layer en|ru              выбрать слой экранной клавиатуры (нужен wvkbd, собранный с патчем layout-sync)
+  osk float on|off|toggle      плавающая (компактная, двигается) / полная клавиатура; нужен wvkbd с патчем float (`osk build`)
+  osk float size up|down|0.6   размер плавающей (доля от полной, пропорционально; шрифт не меняется)
+  osk float reset              вернуть положение и размер плавающей по умолчанию
+  osk float status             текущее состояние плавающего режима
 
 Конфиг: $OSK_CONFIG или ~/.config/osk/osk.toml
 """
+import json
 import os
 import shutil
 import signal
@@ -33,6 +38,19 @@ CONF = Path(os.environ.get("OSK_CONFIG", HOME / ".config/osk/osk.toml"))
 RUN = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 STATE = RUN / "osk.state"
 PIDFILE = RUN / "osk.pid"
+FSTATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk" / "float.json"   # режим, позиция, размер плавающей
+FLT = {}                                # секция [floating] из osk.toml (заполняет load)
+FLOAT_DEFAULTS = {
+    "start": False,                    # начинать сразу в плавающем режиме (дальше запоминается выбор из меню)
+    "scale": 0.5,                      # размер плавающей: доля от полной (ширина и высота пропорционально)
+    "step": 1.15,                      # шаг кнопок «больше / меньше»
+    "min_scale": 0.25,
+    "button": 40,                      # размер круглой кнопки, когда клавиатура свёрнута, px
+    "font": "",                        # шрифт плавающей; пусто = как у полной (keyboard.font). Размер букв не масштабируется
+    "layers": ["widefen", "widefru"],  # слои плавающей (с круглой кнопкой в углу)
+    "x": 24,                           # положение по умолчанию (px от левого верхнего угла)
+    "y": 24,
+}
 SOCK = RUN / "osk-tray.sock"            # команды значку в трее (osk-tray)
 SYNC_MARK = b"OSK_LAYER_SYNC_V1"        # метка в wvkbd, собранном с патчем layout-sync
 TRAY = {}                               # секция [tray] из osk.toml (заполняет load)
@@ -66,6 +84,8 @@ def load():
     except FileNotFoundError:
         print(f"osk: нет конфига {CONF}, работаю с настройками по умолчанию", file=sys.stderr)
     kb = {**DEFAULTS, **data.get("keyboard", {})}
+    FLT.clear()
+    FLT.update({**FLOAT_DEFAULTS, **data.get("floating", {})})
     TRAY.clear()
     TRAY.update(data.get("tray", {}))
     for k in ("binary", "source_dir"):
@@ -81,13 +101,49 @@ def find_binary(kb):
     sys.exit("osk: не найден wvkbd-wide (задай keyboard.binary в osk.toml или выполни `osk build`)")
 
 
+def fstate():
+    try:
+        d = json.loads(FSTATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def fsave(d):
+    try:
+        FSTATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FSTATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d))
+        os.replace(tmp, FSTATE)
+    except OSError as e:
+        print(f"osk: не удалось сохранить {FSTATE}: {e}", file=sys.stderr)
+
+
+def float_on():
+    return bool(fstate().get("on", FLT.get("start", False)))
+
+
+def active_layers(kb):
+    """Слои, с которыми запущена клавиатура (у плавающей свои, с круглой кнопкой)."""
+    if float_on():
+        return list(FLT["layers"])
+    return list(kb["layers"] or ["wideen", "wideru"])
+
+
 def build_cmd(kb, colors, hidden):
+    fl = float_on()
     c = [find_binary(kb), "-H", str(kb["height"]), "-L", str(kb["landscape_height"]),
-         "--fn", kb["font"], "--alpha", str(kb["alpha"]), "-R", str(kb["rounding"])]
-    if kb["layers"]:
-        c += ["-l", ",".join(kb["layers"])]
-    if kb["landscape_layers"]:
-        c += ["--landscape-layers", ",".join(kb["landscape_layers"])]
+         "--fn", (FLT["font"] if fl and FLT["font"] else kb["font"]), "--alpha", str(kb["alpha"]), "-R", str(kb["rounding"])]
+    if fl:
+        fs = fstate()
+        c += ["-l", ",".join(FLT["layers"]), "--landscape-layers", ",".join(FLT["layers"]),
+              "--float", f"{int(fs.get('x', FLT['x']))},{int(fs.get('y', FLT['y']))},{1 if fs.get('collapsed') else 0}",
+              "--float-scale", str(fs.get("scale", FLT["scale"])), "--float-button", str(FLT["button"])]
+    else:
+        if kb["layers"]:
+            c += ["-l", ",".join(kb["layers"])]
+        if kb["landscape_layers"]:
+            c += ["--landscape-layers", ",".join(kb["landscape_layers"])]
     for key, flag in COLOR_FLAGS.items():
         if key in colors:
             c += [flag, str(colors[key])]
@@ -158,6 +214,7 @@ def start(kb, colors, hidden=None):
     log = open(LOG, "ab")
     env = wl_env()
     me = shutil.which("osk") or str(Path(__file__).resolve())
+    env["OSK_FLOAT_CMD"] = f"{me} float-event"      # плавающая сообщает, куда её перетащили / свернули
     env["OSK_LAYOUT_CMD"] = f"{me} layout"      # кнопка EN/RU на экране сообщает системе, какой язык включить
     p = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, start_new_session=True)
     PIDFILE.write_text(str(p.pid))
@@ -182,7 +239,9 @@ def read_sys_layout():
 
 def norm_layout(arg):
     a = (arg or "").strip().lower()
-    if a.startswith("wide"):
+    if a.startswith("widef"):
+        a = a[5:]
+    elif a.startswith("wide"):
         a = a[4:]
     if a in ("en", "ru"):
         return a.upper()
@@ -193,7 +252,7 @@ def norm_layout(arg):
 
 def layer_signal(kb, code):
     """Сигнал wvkbd, выбирающий слой по коду раскладки: SIGRTMIN+N = N-й слой из keyboard.layers."""
-    for i, name in enumerate(kb["layers"] or ["wideen", "wideru"]):
+    for i, name in enumerate(active_layers(kb)):
         if name.lower().endswith(code.lower()):
             return signal.SIGRTMIN + 1 + i
     return None
@@ -261,6 +320,66 @@ def cmd_layout(kb, arg):
     target = ("RU" if cur == "EN" else "EN") if code == "TOGGLE" else code
     if target != cur and inject_toggle():
         cmd_layer(kb, target, quiet=True)     # значка нет, подстраиваем слой сами
+
+
+def cmd_float(kb, colors, a):
+    sub = a[0] if a else "status"
+    fs = fstate()
+    st = get_state(kb)
+    cur = bool(fs.get("on", FLT["start"]))
+
+    def apply(restart=True):
+        fsave(fs)
+        if restart and st != "stopped":
+            start(kb, colors, hidden=(st == "hidden"))
+
+    if sub in ("on", "off", "toggle"):
+        new = {"on": True, "off": False, "toggle": not cur}[sub]
+        fs["on"] = new
+        apply()
+        print("плавающая клавиатура включена" if new else "полная клавиатура включена")
+    elif sub == "size":
+        sc = float(fs.get("scale", FLT["scale"]))
+        arg = a[1] if len(a) > 1 else "up"
+        if arg in ("up", "+", "bigger"):
+            sc *= float(FLT["step"])
+        elif arg in ("down", "-", "smaller"):
+            sc /= float(FLT["step"])
+        else:
+            try:
+                sc = float(arg)
+                sc = sc / 100 if sc > 1 else sc
+            except ValueError:
+                sys.exit("osk float size up|down|<доля 0.25..1 или проценты>")
+        fs["scale"] = max(float(FLT["min_scale"]), min(1.0, round(sc, 3)))
+        apply(restart=cur)
+        print("размер плавающей:", fs["scale"], "(доля от полной)")
+    elif sub == "reset":
+        fs.update(x=FLT["x"], y=FLT["y"], collapsed=False, scale=FLT["scale"])
+        apply(restart=cur)
+        print("положение и размер плавающей сброшены")
+    elif sub == "status":
+        print("режим:", "плавающая" if cur else "полная", "| размер:", fs.get("scale", FLT["scale"]),
+              "| позиция:", fs.get("x", FLT["x"]), fs.get("y", FLT["y"]), "| свёрнута:", bool(fs.get("collapsed")))
+    else:
+        sys.exit("osk float on|off|toggle|size up|down|N|reset|status")
+
+
+def cmd_float_event(a):
+    """Вызывается самой wvkbd (OSK_FLOAT_CMD): pos X Y | collapsed X Y | expanded X Y."""
+    if len(a) < 3:
+        return
+    try:
+        what, x, y = a[0], int(a[1]), int(a[2])
+    except ValueError:
+        return
+    fs = fstate()
+    fs.update(x=x, y=y)
+    if what == "collapsed":
+        fs["collapsed"] = True
+    elif what == "expanded":
+        fs["collapsed"] = False
+    fsave(fs)
 
 
 def signal_to(kb, sig, state):
@@ -365,6 +484,10 @@ def main():
         slot()
     elif cmd == "layout":
         cmd_layout(kb, a[1] if len(a) > 1 else "toggle")
+    elif cmd == "float":
+        cmd_float(kb, colors, a[1:])
+    elif cmd == "float-event":
+        cmd_float_event(a[1:])
     elif cmd == "layer":
         cmd_layer(kb, norm_layout(a[1] if len(a) > 1 else "").replace("TOGGLE", ""))
     else:

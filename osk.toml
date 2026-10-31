@@ -16,6 +16,20 @@ start_hidden = false
 non_exclusive = true     # true: клавиатура лежит поверх панели и окон, ничего не сдвигая
 
 # Цвета в формате rrggbb или rrggbbaa. Что не задано - берётся из сборки.
+[floating]
+# Плавающая клавиатура: уменьшенная копия, пропорционально масштабируется, с круглой кнопкой в левом верхнем углу.
+# Клик по кнопке - свернуть в кружок поверх всех окон (в т.ч. полноэкранных) / развернуть; кнопку можно тащить - вместе с ней уезжает клавиатура.
+# Команды: osk float on|off|toggle|size up|size down|0.6|reset|status. Выбор из меню запоминается (~/.cache/osk/float.json).
+start = false                                    # начинать сразу в плавающем режиме
+scale = 0.5                                      # размер: доля от полной (ширина и высота пропорционально)
+step = 1.15                                      # шаг пунктов «больше / меньше»
+min_scale = 0.25
+button = 40                                      # диаметр круглой кнопки (свёрнутое состояние), px
+font = ""                                        # шрифт плавающей; пусто = как у полной. Размер букв НЕ уменьшается вместе с кнопками
+layers = ["widefen", "widefru"]                  # слои плавающей
+x = 24                                           # положение по умолчанию, px от левого верхнего угла
+y = 24
+
 [colors]
 # bg = "0f0f0f"        # фон клавиатуры
 # fg = "2d2d2d"        # обычные клавиши
@@ -100,6 +114,13 @@ menu_width = 300
 menu_bg = "262626"
 menu_fg = "f0f0f0"
 menu_hover = "3d6fd8"
+# --- сторож панели задач (xfce4-panel) ---
+panel_watchdog = true                            # если панель пропала - поднять заново. Отключаемо: пункт меню или `osk-tray panel watch off`
+panel_process = "xfce4-panel"
+panel_start = "xfce4-panel"                      # команда запуска панели
+panel_check_s = 5                                # период проверки, с
+panel_grace_s = 8                                # сколько секунд панели нет, прежде чем поднимать
+panel_max_restarts = 3                           # не больше стольких перезапусков за 5 минут
 # --- общее ---
 layout_state_file = ""
 sync_layer = true                                # слой экранной клавиатуры меняется вслед за языком системы
@@ -135,9 +156,20 @@ label = "Показать / скрыть клавиатуру"
 command = "~/.local/bin/osk toggle"
 
 [[tray.menu]]
-label = "Открепить клавиатуру (скоро)"
-command = "~/.local/bin/osk float"
-enabled = false
+label = "Плавающая / полная клавиатура"
+command = "~/.local/bin/osk float toggle"
+
+[[tray.menu]]
+label = "Плавающая: крупнее"
+command = "~/.local/bin/osk float size up"
+
+[[tray.menu]]
+label = "Плавающая: мельче"
+command = "~/.local/bin/osk float size down"
+
+[[tray.menu]]
+label = "Плавающая: размер по умолчанию"
+command = "~/.local/bin/osk float reset"
 
 [[tray.menu]]
 separator = true
@@ -153,6 +185,17 @@ command = "mousepad ~/.config/osk/osk.toml"
 [[tray.menu]]
 label = "Перезапустить клавиатуру"
 command = "~/.local/bin/osk restart"
+
+[[tray.menu]]
+separator = true
+
+[[tray.menu]]
+label = "Перезапустить панель задач"
+command = "~/.local/bin/osk-tray panel restart"
+
+[[tray.menu]]
+label = "Сторож панели: вкл / выкл"
+command = "~/.local/bin/osk-tray panel watch toggle"
 
 [[tray.menu]]
 separator = true

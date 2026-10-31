@@ -28,6 +28,9 @@
   osk-tray dblclick [мс]                       показать / задать время двойного клика
   osk-tray (сторож)                            значок запускается под присмотром: упал - поднимется сам; `stop` останавливает всё
   osk-tray hide | show | toggle                явно скрыть / показать / переключить экранную клавиатуру
+  osk-tray panel restart                       перезапустить панель задач (xfce4-panel -r, иначе запуск заново)
+  osk-tray panel watch on|off|toggle|status    сторож панели: если панель пропала - поднимет её заново
+                                               (не поднимает, пока на экране полноэкранное окно - не перекроет игру/видео)
   osk-tray layout en|ru|toggle | place | menu  команда работающему значку
   osk-tray diag                                что доступно (layer-shell, Wayland) и запущен ли значок
 
@@ -142,11 +145,23 @@ DEFAULTS = {
     "menu_x_margin": 8,
     "menu_y_margin": 48,
     "menu_width_chars": 36,
+    # --- сторож панели задач (xfce4-panel) ---
+    "panel_watchdog": True,             # перезапускать панель, если она пропала (отключаемо: меню или `osk-tray panel watch off`)
+    "panel_process": "xfce4-panel",     # имя процесса панели
+    "panel_start": "xfce4-panel",       # команда запуска, если панели нет (без полноэкранных окон на экране)
+    "panel_check_s": 5,                 # как часто проверять
+    "panel_grace_s": 8,                 # сколько секунд панели «нет», прежде чем поднимать (чтобы не мешать ручному перезапуску)
+    "panel_max_restarts": 3,            # не больше стольких перезапусков за 5 минут (иначе сдаёмся и сообщаем)
 }
 DEFAULT_MENU = [
     {"label": "Открыть историю буфера обмена", "command": "~/.local/bin/clipd pick --paste"},
     {"label": "Показать / скрыть клавиатуру", "command": "~/.local/bin/osk toggle"},
-    {"label": "Открепить клавиатуру (скоро)", "command": "~/.local/bin/osk float", "enabled": False},
+    {"label": "Плавающая / полная клавиатура", "command": "~/.local/bin/osk float toggle"},
+    {"label": "Плавающая: крупнее", "command": "~/.local/bin/osk float size up"},
+    {"label": "Плавающая: мельче", "command": "~/.local/bin/osk float size down"},
+    {"separator": True},
+    {"label": "Перезапустить панель задач", "command": "~/.local/bin/osk-tray panel restart"},
+    {"label": "Сторож панели: вкл / выкл", "command": "~/.local/bin/osk-tray panel watch toggle"},
     {"separator": True},
     {"label": "Переместить значок", "command": "place"},
     {"label": "Настройки (osk.toml)", "command": "mousepad ~/.config/osk/osk.toml"},
@@ -346,6 +361,79 @@ def dbg(*a):
 def run_cmd(cmd):
     subprocess.Popen(["sh", "-c", os.path.expanduser(cmd) if cmd.startswith("~") else cmd],
                      start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+PANEL_OFF = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk" / "panel-watch-off"   # есть файл - сторож панели выключен
+FSTATE_F = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk" / "float.json"          # состояние плавающей клавиатуры (пишет osk)
+
+
+def panel_running(cfg):
+    """Живой процесс панели (упавший процесс-зомби не считается: он остаётся в списке, пока его не заберёт родитель)."""
+    r = subprocess.run(["pgrep", "-u", str(UID), "-x", cfg["panel_process"]], capture_output=True, text=True)
+    for pid in r.stdout.split():
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            continue
+        if state != "Z":
+            return True
+    return False
+
+
+def panel_spawn(cfg):
+    import shlex
+    # через промежуточную оболочку: панель становится «внучкой» значка и не оставляет зомби, когда падает
+    subprocess.Popen(["sh", "-c", os.path.expanduser(cfg["panel_start"]) + " &"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+
+
+def panel_restart(cfg):
+    """Ручной перезапуск панели (пункт меню): мягко через `xfce4-panel -r`, если она жива, иначе просто запуск."""
+    if panel_running(cfg) and shutil.which("xfce4-panel"):
+        subprocess.Popen(["xfce4-panel", "-r"], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logf("панель: ручной перезапуск (xfce4-panel -r)")
+        return "перезапускаю панель задач"
+    panel_spawn(cfg)
+    logf("панель: ручной запуск (процесса не было)")
+    return "панель не работала - запускаю"
+
+
+def panel_watch_enabled(cfg):
+    return bool(cfg["panel_watchdog"]) and not PANEL_OFF.exists()
+
+
+def cmd_panel(argv):
+    """osk-tray panel restart | watch on|off|toggle|status"""
+    cfg = load_cfg()
+    sub = argv[0] if argv else "status"
+    if sub == "restart":
+        msg = panel_restart(cfg)
+        print(msg)
+        notify(msg)
+    elif sub == "watch":
+        act = argv[1] if len(argv) > 1 else "status"
+        on = panel_watch_enabled(cfg)
+        if act == "toggle":
+            act = "off" if on else "on"
+        if act in ("on", "off"):
+            try:
+                PANEL_OFF.parent.mkdir(parents=True, exist_ok=True)
+                if act == "off":
+                    PANEL_OFF.write_text("1")
+                else:
+                    PANEL_OFF.unlink(missing_ok=True)
+            except OSError as e:
+                sys.exit(f"не удалось: {e}")
+            if act == "on" and not cfg["panel_watchdog"]:
+                print("внимание: в osk.toml задано panel_watchdog = false - сторож остаётся выключенным")
+            msg = "сторож панели " + ("включён" if act == "on" else "выключен")
+            print(msg)
+            notify(msg)
+        else:
+            print("сторож панели:", "включён" if on else "выключен", "| панель:", "работает" if panel_running(cfg) else "НЕ РАБОТАЕТ")
+    else:
+        sys.exit("osk-tray panel restart | panel watch on|off|toggle|status")
 
 
 def notify(msg):
@@ -556,6 +644,10 @@ class Toplevels:
         hid = self.active_id()
         return hid if hid is not None and 3 in self.items[hid]["state"] else None
 
+    def any_fullscreen(self):
+        """Есть ли на экране полноэкранное (не свёрнутое) окно: поверх него панель показывать нельзя."""
+        return any(3 in it.get("state", ()) and 1 not in it.get("state", ()) for it in self.items.values())
+
     def activate(self, hid):
         self._send(hid, 4, struct.pack("<I", self.seat))     # zwlr_foreign_toplevel_handle_v1.activate(seat)
 
@@ -612,6 +704,11 @@ class Core:
         GLib.timeout_add(cfg["poll_ms"], self.tick_layout)
         GLib.timeout_add(cfg["osk_poll_ms"], self.tick_osk)
         GLib.timeout_add(1500, self.sync_layer_once)    # слой клавиатуры = язык системы (если клавиатура уже запущена)
+        self.panel_down_since = None
+        self.panel_restarts = []
+        self.panel_gave_up = 0
+        self.panel_deferred = False
+        GLib.timeout_add(max(2, int(cfg["panel_check_s"])) * 1000, self.tick_panel)
 
     # ---- команды от `osk` и из терминала ----
     def open_socket(self):
@@ -635,11 +732,55 @@ class Core:
             elif words[0] == "place":
                 self.place()
             elif words[0] == "menu":
+                self.menu_origin = "kbd"          # вызвано клавишей Menu на экранной клавиатуре: меню рядом с ней
                 self.show_menu()
             elif words[0] == "refocus":
                 self.top.refocus()
             elif words[0] == "quit":
                 self.loop.quit()
+        return True
+
+    # ---- сторож панели задач ----
+    def tick_panel(self):
+        cfg = self.cfg
+        try:
+            if not panel_watch_enabled(cfg):
+                self.panel_down_since = None
+                return True
+            if panel_running(cfg):
+                if self.panel_down_since is not None:
+                    logf("панель: снова работает")
+                self.panel_down_since = None
+                self.panel_deferred = False
+                return True
+            now = time.time()
+            if self.panel_down_since is None:
+                self.panel_down_since = now                  # заметили пропажу: ждём grace (вдруг идёт ручной перезапуск)
+                logf("панель: процесса нет, жду " + str(cfg["panel_grace_s"]) + " с")
+                return True
+            if now - self.panel_down_since < float(cfg["panel_grace_s"]):
+                return True
+            if self.top.ok and self.top.any_fullscreen():     # поверх полноэкранной программы панель не поднимаем
+                if not self.panel_deferred:
+                    logf("панель: нет, но на экране полноэкранное окно - подожду")
+                    self.panel_deferred = True
+                return True
+            if now < self.panel_gave_up:
+                return True
+            self.panel_restarts = [x for x in self.panel_restarts if now - x < 300]
+            if len(self.panel_restarts) >= int(cfg["panel_max_restarts"]):
+                self.panel_gave_up = now + 600
+                logf("панель: слишком частые падения, сторож делает паузу на 10 минут")
+                notify("Панель задач падает слишком часто: сторож на паузе 10 минут. Перезапуск вручную - в меню значка.")
+                return True
+            self.panel_restarts.append(now)
+            panel_spawn(cfg)
+            self.panel_down_since = None
+            self.panel_deferred = False
+            logf("панель: пропала, запускаю заново")
+            notify("Панель задач пропала - запускаю заново")
+        except Exception as e:                                # сторож не должен падать сам
+            logf("сторож панели: ошибка " + repr(e))
         return True
 
     # ---- раскладка ----
@@ -655,6 +796,7 @@ class Core:
             for ms in (60, 200, 500):                    # дождаться, пока feeder обновит файл раскладки
                 GLib.timeout_add(ms, self.refresh_once)
 
+    menu_origin = None
     synced = None                    # язык, о котором экранной клавиатуре уже сообщили
     sync_proc = None
     osk_pid = None
@@ -1210,12 +1352,27 @@ class LayerTray(Core):
             dbg("высота панели:", self._ph)
         return self._ph
 
-    def kbd_top(self):
-        """Верхняя граница экранной клавиатуры (она стоит над панелью), None если клавиатуры на экране нет."""
+    def kbd_rect(self):
+        """Прямоугольник экранной клавиатуры (x, y, w, h), None если её на экране нет.
+        Полная стоит над панелью; плавающая - где её оставили (положение и размер пишет `osk`)."""
         if not self.osk_shown:
             return None
-        _w, h = self.screen_size()
-        return h - self.panel_h() - int(self.cfg["kbd_h"])
+        sw, sh = self.screen_size()
+        try:
+            fs = json.loads(FSTATE_F.read_text())
+        except (OSError, ValueError):
+            fs = {}
+        if fs.get("on"):
+            sc = float(fs.get("scale", 0.5))
+            if fs.get("collapsed"):
+                return (int(fs.get("x", 24)), int(fs.get("y", 24)), 40, 40)
+            return (int(fs.get("x", 24)), int(fs.get("y", 24)), int(sw * sc), max(90, int(int(self.cfg["kbd_h"]) * sc)))
+        kh = int(self.cfg["kbd_h"])
+        return (0, sh - self.panel_h() - kh, sw, kh)
+
+    def kbd_top(self):
+        r = self.kbd_rect()
+        return None if r is None else r[1]
 
     def apply_position(self):
         E = GtkLayerShell.Edge
@@ -1448,9 +1605,19 @@ class LayerTray(Core):
         iy = self.eff_y()
         gap = int(self.cfg["menu_gap"])
         left = max(4, min(self.x + self.size - mw, sw - mw - 4))
-        kt = self.kbd_top()
-        if kt is not None and iy + self.size > kt:          # значок под клавиатурой: меню выше её верхней кромки
-            top = kt - mh - gap
+        origin, self.menu_origin = self.menu_origin, None
+        kr = self.kbd_rect()
+        overlap = kr is not None and not (self.x + self.size <= kr[0] or self.x >= kr[0] + kr[2] or
+                                          iy + self.size <= kr[1] or iy >= kr[1] + kr[3])
+        if kr is not None and origin == "kbd":              # вызвано клавишей Menu: над клавиатурой, у её правого края
+            left = max(4, min(kr[0] + kr[2] - mw, sw - mw - 4))
+            top = kr[1] - mh - gap
+            if top < 4:                                     # сверху нет места - под клавиатурой
+                top = kr[1] + kr[3] + gap
+        elif kr is not None and overlap:                    # значок под клавиатурой: меню выше её верхней кромки
+            top = kr[1] - mh - gap
+            if top < 4:
+                top = kr[1] + kr[3] + gap
         else:
             top = iy - mh - gap if iy + self.size / 2 > sh / 2 else iy + self.size + gap
         top = max(4, min(top, sh - mh - 4))
@@ -1703,6 +1870,8 @@ def main():
             print("double_click_ms =", sys.argv[2], "(пауза до смены раскладки при одиночном клике); перезапускаю значок")
             cmd_stop()
             return cmd_start()
+        if sys.argv[1] == "panel":                         # osk-tray panel restart | watch on|off|toggle|status
+            return cmd_panel(sys.argv[2:])
         if sys.argv[1] in ("layout", "place", "menu", "quit", "refocus"):
             client(sys.argv[1:])
             return
