@@ -49,6 +49,104 @@ scheme = 1
 tap_cmd = "$HOME/.local/bin/osk-tray menu"      # короткое нажатие = меню значка (там же переключение плавающая/полная)
 hold_code = "KEY_MENU"                          # удержание = настоящая клавиша Menu (контекстное меню приложения)
 
+# Команды Ctrl+клавиша (страницы символов, верхний ряд)
+[keys.Undo]
+l = "Undo"
+s = "Undo"
+type = "Code"
+code = "KEY_Z"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Redo]
+l = "Redo"
+s = "Redo"
+type = "Code"
+code = "KEY_Y"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Find]
+l = "Find"
+s = "Find"
+type = "Code"
+code = "KEY_F"
+mod = "Ctrl"
+scheme = 1
+
+[keys.SelAll]
+l = "All"
+s = "All"
+type = "Code"
+code = "KEY_A"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Save]
+l = "Save"
+s = "Save"
+type = "Code"
+code = "KEY_S"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Open]
+l = "Open"
+s = "Open"
+type = "Code"
+code = "KEY_O"
+mod = "Ctrl"
+scheme = 1
+
+[keys.New]
+l = "New"
+s = "New"
+type = "Code"
+code = "KEY_N"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Print]
+l = "Print"
+s = "Print"
+type = "Code"
+code = "KEY_P"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Bold]
+l = "Bold"
+s = "Bold"
+type = "Code"
+code = "KEY_B"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Italic]
+l = "Ital"
+s = "Ital"
+type = "Code"
+code = "KEY_I"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Under]
+l = "Undl"
+s = "Undl"
+type = "Code"
+code = "KEY_U"
+mod = "Ctrl"
+scheme = 1
+
+[keys.Close]
+l = "Close"
+s = "Close"
+type = "Code"
+code = "KEY_W"
+mod = "Ctrl"
+scheme = 1
+
+
 [layout.en]
 keymap = "latin"
 label = "EN"
@@ -59,7 +157,7 @@ rows = [
   "Tab:1.5 q w e r t y u i o p lbrace rbrace bslash:1.5 _:0.5 Del End PgDn",
   "Caps:1.75 a s d f g h j k l semi apos Enter:2.25 _:3.5",
   "Shift:2.25 z x c v b n m comma dot slash Shift:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
-  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >ru:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
+  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >ru+s1:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
 ]
 
 [layout.ru]
@@ -72,7 +170,7 @@ rows = [
   "Tab:1.5 й=Q ц=W у=E к=R е=T н=Y г=U ш=I щ=O з=P х=LEFTBRACE ъ=RIGHTBRACE cbslash:1.5 _:0.5 Del End PgDn",
   "Caps:1.75 ф=A ы=S в=D а=F п=G р=H о=J л=K д=L ж=SEMICOLON э=APOSTROPHE Enter:2.25 _:0.5 cslash _:2",
   "Shift:2.25 я=Z ч=X с=C м=V и=B т=N ь=M б=COMMA ю=DOT ./?=SLASH Shift:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
-  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >en:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
+  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >en+s1:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
 ]
 
 # Плавающие слои (первая строка: круглая кнопка слева вместо пустого места после Esc; переключение EN/RU между собой)
@@ -86,7 +184,7 @@ rows = [
   "Tab:1.5 q w e r t y u i o p lbrace rbrace bslash:1.5 _:0.5 Del End PgDn",
   "Caps:1.75 a s d f g h j k l semi apos Enter:2.25 _:3.5",
   "Shift:2.25 z x c v b n m comma dot slash Shift:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
-  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >fru:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
+  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >fru+fs1:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
 ]
 
 [layout.fru]
@@ -99,5 +197,47 @@ rows = [
   "Tab:1.5 й=Q ц=W у=E к=R е=T н=Y г=U ш=I щ=O з=P х=LEFTBRACE ъ=RIGHTBRACE cbslash:1.5 _:0.5 Del End PgDn",
   "Caps:1.75 ф=A ы=S в=D а=F п=G р=H о=J л=K д=L ж=SEMICOLON э=APOSTROPHE Enter:2.25 _:0.5 cslash _:2",
   "Shift:2.25 я=Z ч=X с=C м=V и=B т=N ь=M б=COMMA ю=DOT ./?=SLASH Shift:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
-  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >fen:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
+  "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 >fen+fs1:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
 ]
+
+# ---------------------------------------------------------------------------
+# Страницы символов: удержание кнопки языка (EN/RU) открывает их, Shift листает по кругу, «abc» возвращает к буквам.
+# Каждая страница - ровно 46 символов (ряды 13+12+11+10 клавиш, как у буквенной раскладки); вводятся как Unicode.
+# Страницы 3-9 - цветные эмодзи. Символы, которым для цвета нужен селектор (❤ ♻ ⚠ ✔ ☑), не берём - они чёрно-белые.
+# top = "actions": верхний ряд - команды Ctrl+Z/Y/F/A/S/O/N/P/B/I/U/W; иначе обычные F-клавиши.
+
+[[sym]]
+top = "actions"
+chars = """@`’´+-–—"':;“ {}«»±×÷~≈≠∞… №%^™©®℗§$£€ ¢₴•°¶₽₸¥₿₤"""
+
+[[sym]]
+top = "actions"
+chars = """↑↓→←↔↕↨▲►▼◄☺☼♠♣♥♦▬█▌▐▀░▒▓✓✘‼⁈⁉¿¡‽❢❣⸮ǃ！？⚠⁇※¦†‡‰"""
+
+[[sym]]
+top = "fkeys"
+chars = """😀😃😄😁😆😅😂🤣😊😇🙂🙃😉😌😍🥰😘😗😙😚😋😛😝😜🤪🤨🧐🤓😎🤩🥳😏😒😞😔😟😕🙁😣😖😫😩🥺😢😺😸"""
+
+[[sym]]
+top = "fkeys"
+chars = """😭😤😠😡🤬🤯😳🥵🥶😱😨😰😥😓🤗🤔🤭🤫🤥😶😐😑😬🙄😯😦😧😮😲🥱😴🤤😪😵🤐🥴🤢🤮🤧😷🤒🤕🤑🤠😈👿"""
+
+[[sym]]
+top = "fkeys"
+chars = """👍👎👊✊🤛🤜👏🙌👐🤲🤝🙏💪🦾👋🤚✋🖖👌🤌🤏🤞🤟🤘🤙👈👉👆👇👀👂👃👄👅🧠👶🧒👨👩👴👵💀👻👽🤖💩"""
+
+[[sym]]
+top = "fkeys"
+chars = """🐶🐱🐭🐹🐰🦊🐻🐼🐨🐯🦁🐮🐷🐸🐵🙈🙉🙊🐔🐧🐦🐤🦆🦅🦉🦇🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🐢🐍🦎🐙🦑🦀🐠🐟🐬🐳"""
+
+[[sym]]
+top = "fkeys"
+chars = """🍏🍎🍐🍊🍋🍌🍉🍇🍓🍒🍑🥭🍍🥥🥝🍅🍆🥑🥦🥕🌽🥔🍞🥐🧀🥚🍳🥓🍗🍔🍟🍕🌭🥪🌮🍿🍩🍪🎂🍰🍫🍬🍭☕🍺🥃"""
+
+[[sym]]
+top = "fkeys"
+chars = """📱💻⌚⌛⏳🔋💡🔦📷📹📺📻🎧🎤🔔🔑🔒🔓📌📍📎📝📋📥📤📦📈📉📊📅🔎🔍💰💳💎🔧🔨🔩🧲💣🧨🔥💥🎁🎈🎃"""
+
+[[sym]]
+top = "fkeys"
+chars = """🧡💛💚💙💜🖤🤍🤎💔💕💖💗🔴🟠🟡🟢🔵🟣🟤⚫⚪🟥🟧🟨🟩🟦🟪⬛⬜🔶🔷🔺🔻✅❌❎❓❗❔❕🚦🚧🛑🔢🌈⚡"""

@@ -50,6 +50,10 @@ FLOAT_DEFAULTS = {
     "layers": ["widefen", "widefru"],  # слои плавающей (с круглой кнопкой в углу)
     "x": 24,                           # положение по умолчанию (px от левого верхнего угла)
     "y": 24,
+    "double_click_ms": 350,            # окно двойного клика на кружке; 0 - выкл. (тогда клик сворачивает/разворачивает сразу)
+    "right_click": "~/.local/bin/osk-tray menu",                 # ПКМ по кружку (состояние клавиатуры не меняется)
+    "double_click": "~/.local/bin/clipd pick --paste --toggle",  # двойной ЛКМ: история буфера
+    "middle_click": "~/.local/bin/clipd tpl --toggle",           # СКМ: шаблоны
 }
 SOCK = RUN / "osk-tray.sock"            # команды значку в трее (osk-tray)
 SYNC_MARK = b"OSK_LAYER_SYNC_V1"        # метка в wvkbd, собранном с патчем layout-sync
@@ -138,7 +142,8 @@ def build_cmd(kb, colors, hidden):
         fs = fstate()
         c += ["-l", ",".join(FLT["layers"]), "--landscape-layers", ",".join(FLT["layers"]),
               "--float", f"{int(fs.get('x', FLT['x']))},{int(fs.get('y', FLT['y']))},{1 if fs.get('collapsed') else 0}",
-              "--float-scale", str(fs.get("scale", FLT["scale"])), "--float-button", str(FLT["button"])]
+              "--float-scale", str(fs.get("scale", FLT["scale"])), "--float-button", str(FLT["button"]),
+              "--float-dbl", str(int(FLT["double_click_ms"]))]
     else:
         if kb["layers"]:
             c += ["-l", ",".join(kb["layers"])]
@@ -372,6 +377,12 @@ def cmd_float_event(a):
     try:
         what, x, y = a[0], int(a[1]), int(a[2])
     except ValueError:
+        return
+    if what in ("right", "double", "middle"):          # клики по кружку: команды из [floating], состояние не трогаем
+        cmd = FLT.get({"right": "right_click", "double": "double_click", "middle": "middle_click"}[what], "")
+        if cmd:
+            subprocess.Popen(["sh", "-c", os.path.expanduser(cmd).replace("$HOME", str(HOME))], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
     fs = fstate()
     fs.update(x=x, y=y)

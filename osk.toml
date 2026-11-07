@@ -29,6 +29,11 @@ font = ""                                        # шрифт плавающей
 layers = ["widefen", "widefru"]                  # слои плавающей
 x = 24                                           # положение по умолчанию, px от левого верхнего угла
 y = 24
+double_click_ms = 350                            # окно двойного клика на кружке (мс); 0 - выкл., тогда клик сворачивает/разворачивает сразу
+# Клики по кружку (в левом верхнем углу клавиатуры или свёрнутому): состояние клавиатуры при них не меняется
+right_click  = "~/.local/bin/osk-tray menu"      # правая кнопка: меню (то же, что у значка языка и кнопки Menu)
+double_click = "~/.local/bin/clipd pick --paste --toggle"   # двойной клик левой: история буфера
+middle_click = "~/.local/bin/clipd tpl --toggle" # средняя: шаблоны
 
 [colors]
 # bg = "0f0f0f"        # фон клавиатуры
@@ -40,6 +45,13 @@ y = 24
 # text_sp = "ffffff"
 
 [clipboard]
+# Внешний вид окон истории и шаблонов (чёткость текста):
+font = ""                        # семейство шрифта, пусто = системный (например "Noto Sans", "DejaVu Sans")
+font_size = 0                    # размер, pt; 0 = системный. Для VNC/Moonlight удобнее 12-13
+font_weight = ""                 # "", "bold" или число 300-700
+text_color = "#111111"           # цвет текста; "" = как в теме
+font_hint = "full"               # none | slight | medium | full - подгонка символов под пиксели (чётче)
+font_antialias = "gray"          # gray | subpixel | none | default (при сжатом видео лучше gray)
 device = "raspi"                 # имя этого устройства в файлах claude_bufer
 sync_dir = "~/Syncthing/Zametki_ALL/claude_bufer"
 max_entries = 500                # сколько записей хранить в clip_hist-<device>.txt
@@ -157,6 +169,9 @@ command = "~/.local/bin/osk toggle"
 
 [[tray.menu]]
 label = "Плавающая / полная клавиатура"
+state = "float"                                  # подпись показывает состояние: label_on / label_off
+label_on = "✅ Плавающая клавиатура вкл"
+label_off = "⬜ Плавающая клавиатура выкл"
 command = "~/.local/bin/osk float toggle"
 
 [[tray.menu]]
@@ -195,6 +210,9 @@ command = "~/.local/bin/osk-tray panel restart"
 
 [[tray.menu]]
 label = "Сторож панели: вкл / выкл"
+state = "panel_watch"
+label_on = "✅ Сторож панели вкл"
+label_off = "⬜ Сторож панели выкл"
 command = "~/.local/bin/osk-tray panel watch toggle"
 
 [[tray.menu]]

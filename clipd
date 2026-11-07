@@ -69,8 +69,68 @@ DEFAULTS = {
     "paste_mods_terminal": ["ctrl", "shift"],            # вставка в терминалы (определяются по app_id окна, список выше)
     "window_width": 700,
     "window_height": 540,
+    # --- внешний вид окон истории и шаблонов (чёткость текста) ---
+    "font": "",                                          # семейство шрифта (пусто = системный), например "Noto Sans"
+    "font_size": 0,                                      # размер, pt (0 = системный); при трансляции по VNC/Moonlight лучше 12-13
+    "font_weight": "",                                   # "", "bold" или число 300-700
+    "text_color": "#111111",                             # цвет текста ("" = как в теме)
+    "font_hint": "full",                                 # none | slight | medium | full: подгонка символов под пиксели (чётче)
+    "font_antialias": "gray",                            # gray | subpixel | none | default (при сжатии видео лучше gray)
     "close_on_focus_out": True,                          # закрывать окно при клике мимо
 }
+
+
+def apply_look(cfg, Gtk, Gdk):
+    """Чёткость текста: подгонка шрифта под пиксели, цвет, размер и начертание (настройки font* в [clipboard])."""
+    hint = str(cfg.get("font_hint", "full"))
+    aa = str(cfg.get("font_antialias", "gray"))
+    try:                                                 # настройки GTK (работают без pycairo)
+        st = Gtk.Settings.get_default()
+        if hint in ("none", "slight", "medium", "full"):
+            st.set_property("gtk-xft-hinting", 0 if hint == "none" else 1)
+            st.set_property("gtk-xft-hintstyle", "hintnone" if hint == "none" else "hint" + hint)
+        if aa in ("gray", "subpixel", "none"):
+            st.set_property("gtk-xft-antialias", 0 if aa == "none" else 1)
+            st.set_property("gtk-xft-rgba", "rgb" if aa == "subpixel" else "none")
+    except Exception as e:
+        log(f"шрифт: настройки GTK не применились: {e}")
+    try:                                                 # параметры отрисовки экрана (нужен python3-gi-cairo)
+        import cairo
+        o = cairo.FontOptions()
+        o.set_hint_style({"none": cairo.HINT_STYLE_NONE, "slight": cairo.HINT_STYLE_SLIGHT,
+                          "medium": cairo.HINT_STYLE_MEDIUM, "full": cairo.HINT_STYLE_FULL}.get(hint, cairo.HINT_STYLE_DEFAULT))
+        o.set_hint_metrics(cairo.HINT_METRICS_ON)
+        o.set_antialias({"gray": cairo.ANTIALIAS_GRAY, "subpixel": cairo.ANTIALIAS_SUBPIXEL,
+                         "none": cairo.ANTIALIAS_NONE}.get(aa, cairo.ANTIALIAS_DEFAULT))
+        if aa == "subpixel":
+            o.set_subpixel_order(cairo.SUBPIXEL_ORDER_RGB)
+        Gdk.Screen.get_default().set_font_options(o)
+    except Exception as e:
+        log(f"шрифт: pycairo недоступен, подгонка через настройки GTK ({e})")
+    decl = []
+    fam = str(cfg.get("font", "")).replace('"', "")
+    if fam:
+        decl.append(f'font-family: "{fam}";')
+    if float(cfg.get("font_size", 0) or 0) > 0:
+        decl.append(f"font-size: {float(cfg['font_size'])}pt;")
+    if str(cfg.get("font_weight", "")):
+        decl.append(f"font-weight: {cfg['font_weight']};")
+    if str(cfg.get("text_color", "")):
+        decl.append(f"color: {cfg['text_color']};")
+    rules = []
+    if decl:
+        body = " ".join(decl)
+        rules.append(f".osk-clip label, .osk-clip entry, .osk-clip button, .osk-clip textview text {{ {body} }}")
+        rules.append(".osk-clip row:selected label { color: #ffffff; }")
+    if rules:
+        css = Gtk.CssProvider()
+        try:
+            css.load_from_data("\n".join(rules).encode("utf-8"))
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        except Exception as e:
+            log(f"шрифт: CSS не принят: {e}")
+
 
 CLOSE = "\u2715 Закрыть"
 SPLIT = re.compile(r"(?:^|\n)===ENTRY (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)===\n")
@@ -682,6 +742,7 @@ def build_window(cfg, tabs, choose, L=None):
         win.set_keep_above(True)
         win.set_position(Gtk.WindowPosition.MOUSE)     # на Wayland игнорируется
 
+    apply_look(cfg, Gtk, Gdk)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     box.get_style_context().add_class("osk-clip")
     for side in ("top", "bottom", "start", "end"):
@@ -775,7 +836,7 @@ def build_window(cfg, tabs, choose, L=None):
             getattr(rbox, f"set_margin_{side}")(5)
         if ts:
             tl = Gtk.Label()
-            tl.set_markup('<span size="small" alpha="60%">' +
+            tl.set_markup('<span size="small" alpha="78%">' +
                           GLib.markup_escape_text(ts.replace("T", " ")) + "</span>")
             tl.set_xalign(0)
             rbox.pack_start(tl, False, False, 0)
@@ -1581,6 +1642,7 @@ def build_tpl_window(cfg, L, root, choose, default_action):
         win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
         win.set_keep_above(True)
 
+    apply_look(cfg, Gtk, Gdk)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     box.get_style_context().add_class("osk-clip")
     for side in ("top", "bottom", "start", "end"):

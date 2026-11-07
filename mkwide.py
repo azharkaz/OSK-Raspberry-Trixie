@@ -19,6 +19,13 @@
      hold_code/hold_mod/hold_cmd - что делать при удержании клавиши, tap_cmd - команда на короткое нажатие)
     FBtn:1       круглая кнопка плавающего режима (клик - свернуть/развернуть, перетаскивание - двигать)
     4/;=4        метка/метка на shift = код
+    >ru+s1:1.25  кнопка языка: короткое нажатие - раскладка ru, удержание - страница символов s1
+    <back:1.25   «abc»: вернуться на последнюю буквенную раскладку
+    $            (в раскладках [[sym]]) символ из chars, вводится как Unicode (тип Copy)
+
+Страницы символов и эмодзи - таблицы [[sym]] в TOML: chars (46 символов) и top ("actions" - ряд команд Ctrl+...,
+иначе F-клавиши). Из каждой получаются раскладки sN (обычная) и fsN (плавающая, с круглой кнопкой). Кнопка Shift на
+страницах листает их по кругу, «abc» возвращает к буквам.
 """
 import re
 import shutil
@@ -98,8 +105,13 @@ def parse_token(tok, keys):
         return {"type": "Pad", "w": w, "l": "", "s": "", "scheme": 1}
     if body == "FBtn":                            # круглая кнопка плавающего режима (нужен патч float)
         return {"type": "FloatBtn", "w": w, "l": "", "s": "", "scheme": 1}
+    if body == "<back":                           # назад на буквенную раскладку (страницы символов)
+        return {"type": "BackLayer", "w": w, "l": "abc", "s": "abc", "scheme": 1}
+    if body == "$":                               # символ из chars раскладки (Unicode, тип Copy)
+        return {"type": "Copy", "w": w, "scheme": 0, "dollar": True}
     if body.startswith(">"):
-        return {"type": "Layout", "w": w, "target": body[1:], "scheme": 0}
+        tgt, _, hold = body[1:].partition("+")     # >ru+s1: на удержание - раскладка s1
+        return {"type": "Layout", "w": w, "target": tgt, "hold": hold, "scheme": 0}
     if "=" in body:
         lab, code = body.rsplit("=", 1)
         if "/" in lab:
@@ -133,7 +145,14 @@ def emit_key(k, name, spec_layouts):
         if tgt not in spec_layouts:
             die(f"кнопка >{tgt}: такой раскладки нет в TOML")
         lab = cstr(spec_layouts[tgt].get("label", tgt.upper()))
-        return f"  {{{lab}, {lab}, {w}, Layout, 0, &layouts[{enum_name(name, tgt)}]{sch}}},"
+        hl = ""
+        if k.get("hold"):                          # удержание: другая раскладка (нужен патч sym)
+            if k["hold"] not in spec_layouts:
+                die(f"кнопка >{tgt}+{k['hold']}: такой раскладки нет в TOML")
+            hl = f", .hold_layout = &layouts[{enum_name(name, k['hold'])}]"
+        return f"  {{{lab}, {lab}, {w}, Layout, 0, &layouts[{enum_name(name, tgt)}]{sch}{hl}}},"
+    if t == "BackLayer":
+        return f'  {{{cstr(k["l"])}, {cstr(k["s"])}, {w}, BackLayer, 0{sch}}},'
     mod = f", 0, {k['mod']}" if k.get("mod") and t == "Code" else ""    # code_mod: модификатор на время нажатия
     hold = ""                                    # действия на удержание (нужен patch_keyboard.py)
     if t == "Code":
@@ -151,14 +170,23 @@ def emit_key(k, name, spec_layouts):
 def build_layout(name, lid, lay, keys, spec_layouts):
     lines = [f"static struct key keys_{name}_{lid}[] = {{"]
     sums = []
+    chars = iter(lay.get("chars", ""))
     for row in lay["rows"]:
         total = 0.0
         for tok in row.split():
             k = parse_token(tok, keys)
+            if k.get("dollar"):                       # символ из chars: подпись = сам символ, ввод как Unicode
+                try:
+                    ch = next(chars)
+                except StopIteration:
+                    die(f"{lid}: символов в chars меньше, чем клавиш «$»")
+                k = {"type": "Copy", "w": k["w"], "scheme": 0, "l": ch, "s": ch, "code": hex(ord(ch))}
             total += k["w"]
             lines.append(emit_key(k, name, spec_layouts))
         sums.append(total)
         lines.append('  {"", "", 0.0, EndRow},\n')
+    if any(True for _ in chars):
+        die(f"{lid}: в chars больше символов, чем клавиш «$»")
     lines[-1] = '  /* end of layout */'
     lines.append('  {"", "", 0.0, Last},')
     lines.append("};\n")
@@ -175,13 +203,46 @@ def patch(text, pattern, repl, what, count=1, flags=0):
     return new
 
 
+SYM_TOP_FKEYS = "Esc _:1 F1 F2 F3 F4 _:0.5 F5 F6 F7 F8 _:0.5 F9 F10 F11 F12 _:0.5 PrtSc ScrLk Pause"
+SYM_TOP_ACTIONS = "Esc _:1 Undo Redo Find SelAll _:0.5 Save Open New Print _:0.5 Bold Italic Under Close _:0.5 PrtSc ScrLk Pause"
+SYM_ROWS = [
+    "{top}",
+    " ".join(["$"] * 13) + " Bksp:2 _:0.5 Ins Home PgUp",
+    "Tab:1.5 " + " ".join(["$"] * 12) + " bslash:1.5 _:0.5 Del End PgDn",
+    "Caps:1.75 " + " ".join(["$"] * 11) + " Enter:2.25 _:3.5",
+    ">{nxt}:2.25 " + " ".join(["$"] * 10) + " >{nxt}:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
+    "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 <back:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
+]
+
+
+def expand_sym(pages):
+    """[[sym]] -> раскладки s1..sN (обычные) и fs1..fsN (плавающие: круглая кнопка вместо пустого места после Esc)."""
+    out = {}
+    n = len(pages)
+    for i, pg in enumerate(pages, 1):
+        chars = "".join(c for c in pg["chars"] if not c.isspace())
+        if len(chars) != 46:
+            die(f"[[sym]] №{i}: нужно 46 символов (13+12+11+10), а их {len(chars)}")
+        top = SYM_TOP_ACTIONS if pg.get("top") == "actions" else SYM_TOP_FKEYS
+        nxt = f"s{i % n + 1}"
+        rows = [r.format(top=top, nxt=nxt) for r in SYM_ROWS]
+        out[f"s{i}"] = {"keymap": pg.get("keymap", "latin"), "label": f"\u21e7 {i}/{n}", "primary": False,
+                        "rows": rows, "chars": chars}
+        frows = [r.replace(">s", ">fs") for r in rows]
+        frows[0] = frows[0].replace("Esc _:1", "FBtn:1 Esc:1", 1)
+        out[f"fs{i}"] = {"keymap": pg.get("keymap", "latin"), "label": f"\u21e7 {i}/{n}", "primary": False,
+                         "rows": frows, "chars": chars}
+    return out
+
+
 def main():
     with open(SPEC, "rb") as f:
         spec = tomllib.load(f)
     st = spec["settings"]
     name = st.get("name", "wide")
     keys = spec.get("keys", {})
-    lays = spec["layout"]
+    lays = dict(spec["layout"])
+    lays.update(expand_sym(spec.get("sym", [])))
     ids = list(lays)
 
     for fn in ("layout", "keymap", "config"):

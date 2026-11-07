@@ -847,6 +847,169 @@ def patch_tap(c, h):
              "osk_fire_hold", hint="osk_send_combo")
     return c, h, True
 
+
+# ---------------- плавающая клавиатура, часть 2: клики значка, перетаскивание в VNC (osk-patch: float2) ----------------
+M_FLOAT2 = "/* osk-patch: float2 */"
+
+FLOAT2_FUNCS = M_FLOAT2 + r'''
+static long
+osk_fl_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static void
+osk_fl_toggle(void)
+{
+    fl_collapsed = !fl_collapsed;
+    osk_fl_cmd(fl_collapsed ? "collapsed" : "expanded", fl_x, fl_y);
+    hide();
+    show();
+}
+
+/* сколько ждать в poll(): пока одиночный клик может оказаться первым из двух - не дольше окна двойного клика */
+static int
+osk_fl_poll_ms(void)
+{
+    long left;
+    if (!fl_pend)
+        return -1;
+    left = fl_dbl - (osk_fl_ms() - fl_pend_t);
+    return left < 1 ? 1 : (int)left;
+}
+
+static void
+osk_fl_tick(void)
+{
+    if (fl_pend && osk_fl_ms() - fl_pend_t >= fl_dbl) {
+        fl_pend = 0;
+        osk_fl_toggle();
+    }
+}
+
+static void
+osk_fl_release(void)
+{
+    if (!fl_drag)
+        return;
+    fl_drag = 0;
+    if (fl_pbtn == 0x111) {                 /* правая кнопка: меню (состояние клавиатуры не меняется) */
+        osk_fl_cmd("right", fl_x, fl_y);
+        return;
+    }
+    if (fl_pbtn == 0x112) {                 /* средняя: шаблоны */
+        osk_fl_cmd("middle", fl_x, fl_y);
+        return;
+    }
+    if (fl_moved) {
+        fl_pend = 0;
+        if (!fl_relmode) {
+            fl_accx = fl_lastx - fl_lx0;
+            fl_accy = fl_lasty - fl_ly0;
+        }
+        osk_fl_flush(1);
+        osk_fl_cmd("pos", fl_x, fl_y);
+        return;
+    }
+    if (fl_dbl <= 0) {                      /* двойной клик отключён: свернуть/развернуть сразу */
+        osk_fl_toggle();
+        return;
+    }
+    if (fl_pend) {                          /* второй клик в окне двойного: история буфера, состояние не меняется */
+        fl_pend = 0;
+        osk_fl_cmd("double", fl_x, fl_y);
+        return;
+    }
+    fl_pend = 1;                            /* ждём: может, это двойной клик */
+    fl_pend_t = osk_fl_ms();
+}
+'''
+
+
+def patch_float2(c, h, m):
+    if M_FLOAT2 in m:
+        return c, h, m, False
+    if M_FLOAT not in m:
+        raise ValueError("«float2»: сначала должен примениться патч float")
+    # переменные
+    m = sub1(m, r"(static int fl_drag = 0,)",
+             lambda mm: "static int fl_pend = 0, fl_relseen = 0, fl_nloc = 0;   " + M_FLOAT2 + "\n"
+             "static long fl_pend_t = 0, fl_dbl = 350;\n"
+             "static uint32_t fl_btn_code = 0x110, fl_pbtn = 0x110;\n" + mm.group(1), "float2 переменные", hint="fl_drag")
+    # кнопка мыши запоминается в начале нажатия; относительное смещение считается «пришедшим»
+    m = sub1(m, r"(    fl_relmode = via_pointer && fl_rel_ptr != NULL;\n)",
+             lambda mm: mm.group(1) + "    fl_pbtn = via_pointer ? fl_btn_code : 0x110;   " + M_FLOAT2 + "\n"
+             "    fl_relseen = 0;\n    fl_nloc = 0;\n", "float2 press", hint="fl_relmode =")
+    m = sub1(m, r"(    if \(!fl_drag \|\| !fl_relmode\)\n        return;\n)",
+             lambda mm: mm.group(1) + "    if (getenv(\"OSK_FL_DEAF\"))              " + M_FLOAT2 + "   /* OSK_FL_DEAF - проверка запасного режима */\n        return;\n"
+             "    fl_relseen = 1;\n    if (fl_pbtn != 0x110)\n        return;\n",
+             "float2 rel_motion", hint="!fl_relmode")
+    # координаты внутри поверхности: если относительных событий нет (VNC, виртуальный указатель) - переходим на них
+    m = sub1(m, r"(static void\nosk_fl_motion\(int x, int y\)\n\{\n)    if \(!fl_drag \|\| fl_relmode\)\n        return;\n    fl_lastx = x;\n    fl_lasty = y;\n",
+             lambda mm: mm.group(1) + "    if (!fl_drag || fl_pbtn != 0x110)       " + M_FLOAT2 + "\n        return;\n"
+             "    fl_lastx = x;\n    fl_lasty = y;\n"
+             "    if (fl_relmode) {\n"
+             "        /* относительные смещения не приходят или нулевые (VNC, виртуальный указатель) - после нескольких движений переходим на координаты поверхности */\n"
+             "        int d = abs(x - fl_lx0) + abs(y - fl_ly0);\n"
+             "        double a = fabs(fl_accx) + fabs(fl_accy);\n"
+             "        if (++fl_nloc < 3 || d < 8 || a * 4.0 >= d)   /* относительные смещения идут нормально (обычная мышь) */\n            return;\n"
+             "        fl_relmode = 0;\n"
+             "    }\n", "float2 motion", hint="osk_fl_motion")
+    # release заменяется целиком (после новых функций)
+    m, n_rel = re.subn(r"static void\nosk_fl_release\(void\)\n\{\n.*?\n\}\n(?=\n)", lambda mm: FLOAT2_FUNCS, m, count=1, flags=re.S)
+    if n_rel != 1:
+        raise ValueError("«float2 release»: функция osk_fl_release не найдена")
+    m = sub1(m, r"osk_fl_press\(cur_x, cur_y, 1\)", "(fl_btn_code = button, osk_fl_press(cur_x, cur_y, 1))", "float2 button", hint="osk_fl_press(cur_x")
+    m = sub1(m, r"        poll\(fds, 2, -1\);\n", "        poll(fds, 2, osk_fl_poll_ms());   " + M_FLOAT2 + "\n        osk_fl_tick();\n", "float2 poll", hint="poll(fds")
+    m = sub1(m, r'(        \} else if \(!strcmp\(argv\[i\], "--float-button"\)\) \{)',
+             lambda mm: '        } else if (!strcmp(argv[i], "--float-dbl")) {   ' + M_FLOAT2 + '\n'
+             '            if (i >= argc - 1) {\n                usage(argv[0]);\n                exit(1);\n            }\n'
+             '            fl_dbl = atol(argv[++i]);\n' + mm.group(1), "float2 args", hint="--float-button")
+    return c, h, m, True
+
+
+# ---------------- страницы символов: удержание кнопки языка (osk-patch: sym) ----------------
+M_SYM = "/* osk-patch: sym */"
+
+
+def patch_sym(c, h):
+    """Кнопка-раскладка (Layout) с hold_layout: короткое нажатие - как обычно, удержание - другая раскладка (страницы символов)."""
+    if M_SYM in c:
+        return c, h, False
+    if M_TAP not in c:
+        raise ValueError("«sym»: сначала должен примениться патч tap-cmd")
+    h = sub1(h, r"([ \t]+)(const char \*tap_cmd;[^\n]*\n)",
+             lambda mm: mm.group(1) + mm.group(2) + mm.group(1) + "struct layout *hold_layout; /* osk: раскладка на удержание кнопки-раскладки */\n",
+             "struct key (hold_layout)", hint="tap_cmd")
+    c = sub1(c, r"(static int osk_mod_double_tap\(struct kbd \*kb, struct key \*k, uint32_t time\);\n)",
+             lambda mm: mm.group(1) + "static void osk_layout_changed(struct kbd *kb);   " + M_SYM + "\n", "прототипы", hint="osk_mod_double_tap")
+    c = sub1(c, r"(    case Layout:\n)(        // switch to the layout determined by the key\n)",
+             lambda mm: mm.group(1) + "        if (k->hold_layout) {                    " + M_SYM + "\n"
+             "            kb->last_swipe = kb->last_press = k;\n"
+             "            kb->last_press_offset = time - monotime();\n"
+             "            kb->hold_pending = k;                /* решится при отпускании: нажатие или удержание */\n"
+             "            kb->press_time = time;\n"
+             "            kbd_draw_key(kb, k, Press);\n"
+             "            break;\n"
+             "        }\n" + mm.group(2), "case Layout", hint="case Layout")
+    c = sub1(c, r"(    kb->hold_pending = NULL;\n    kb->last_press = NULL;\n)(    if \(held && k->hold_cmd\)\n)",
+             lambda mm: mm.group(1) + "    if (k->type == Layout) {                    " + M_SYM + "\n"
+             "        if (held) {                             /* удержание: страницы символов, язык системы не трогаем */\n"
+             "            kb->last_abc_layout = kb->layout;   /* чтобы «abc» вернуло на текущую буквенную раскладку */\n"
+             "            kb->last_abc_index = kb->layer_index;\n"
+             "            kbd_switch_layout(kb, k->hold_layout, kbd_get_layer_index(kb, k->hold_layout));\n"
+             "        } else {                                /* короткое нажатие: как обычная кнопка-раскладка */\n"
+             "            kbd_switch_layout(kb, k->layout, kbd_get_layer_index(kb, k->layout));\n"
+             "            kb->last_abc_index = 0;\n"
+             "            kb->last_abc_layout = kb->landscape ? &kb->layouts[kb->landscape_layers[0]] : &kb->layouts[kb->layers[0]];\n"
+             "            osk_layout_changed(kb);\n"
+             "        }\n"
+             "        return;\n"
+             "    }\n" + mm.group(2), "osk_fire_hold (sym)", hint="hold_pending")
+    return c, h, True
+
 def main():
     if not KC.exists() or not KH.exists() or not KM.exists():
         sys.exit("patch_keyboard: нет keyboard.c/keyboard.h/main.c, запускай из каталога wvkbd")
@@ -856,10 +1019,12 @@ def main():
         c, h, ch_lock = patch_lock(c, h)
         c, m, ch_sync = patch_sync(c, m)
         c, h, ch_tap = patch_tap(c, h)
+        c, h, ch_sym = patch_sym(c, h)
         c, h, m, ch_float = patch_float(c, h, m)
+        c, h, m, ch_float2 = patch_float2(c, h, m)
     except ValueError as e:
         sys.exit(f"patch_keyboard: {e}\nФайлы не изменены. Версия wvkbd отличается - пришли соответствующий кусок кода.")
-    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float):
+    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float or ch_float2 or ch_sym):
         print("patch_keyboard: все правки уже применены")
         return
     for f in (KC, KH, KM):
@@ -868,7 +1033,7 @@ def main():
     KC.write_text(c, encoding="utf-8")
     KH.write_text(h, encoding="utf-8")
     KM.write_text(m, encoding="utf-8")
-    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("float", ch_float)) if ok]
+    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("sym", ch_sym), ("float", ch_float), ("float2", ch_float2)) if ok]
     print("patch_keyboard: применено: " + ", ".join(done))
 
 

@@ -287,6 +287,9 @@ def load_cfg():
     cfg["menu"] = t.get("menu") or DEFAULT_MENU
     k = data.get("keyboard", {})
     cfg["kbd_h"] = int(k.get("landscape_height", k.get("height", 300)))     # высота клавиатуры на экране 1920x1080
+    fl = data.get("floating", {})
+    cfg["float_start"] = bool(fl.get("start", False))
+    cfg["float_button"] = int(fl.get("button", 40))
     if not cfg["layout_state_file"]:
         cfg["layout_state_file"] = str(RUN / "kbd-layout")
     cfg["icons_dir"] = Path(os.path.expanduser(cfg["icons_dir"])) if cfg["icons_dir"] else HERE / "ICONs" / "tray"
@@ -401,6 +404,26 @@ def panel_restart(cfg):
 
 def panel_watch_enabled(cfg):
     return bool(cfg["panel_watchdog"]) and not PANEL_OFF.exists()
+
+
+def float_enabled(cfg):
+    try:
+        return bool(json.loads(FSTATE_F.read_text()).get("on", cfg.get("float_start", False)))
+    except (OSError, ValueError):
+        return bool(cfg.get("float_start", False))
+
+
+def menu_label(cfg, it):
+    """Подпись пункта меню. Пункт с state = "panel_watch" | "float" показывает своё состояние:
+    label_on / label_off (например «✅ Сторож панели вкл» / «⬜ Сторож панели выкл»)."""
+    st = it.get("state")
+    if st == "panel_watch":
+        on = panel_watch_enabled(cfg)
+    elif st == "float":
+        on = float_enabled(cfg)
+    else:
+        return it.get("label", "?")
+    return it.get("label_on" if on else "label_off") or it.get("label", "?")
 
 
 def cmd_panel(argv):
@@ -1007,7 +1030,7 @@ class SniTray(Core):
             if it.get("separator"):
                 props = {"type": GLib.Variant("s", "separator")}
             else:
-                props = {"label": GLib.Variant("s", it.get("label", "?").replace("_", "__")),
+                props = {"label": GLib.Variant("s", menu_label(self.cfg, it).replace("_", "__")),
                          "enabled": GLib.Variant("b", bool(it.get("enabled", True))),
                          "visible": GLib.Variant("b", True)}
             items.append((i, props, it.get("command", "")))
@@ -1092,7 +1115,7 @@ class SniTray(Core):
             if it.get("separator"):
                 props = {"type": GLib.Variant("s", "separator")}
             else:
-                props = {"label": GLib.Variant("s", it.get("label", "?").replace("_", "__")),
+                props = {"label": GLib.Variant("s", menu_label(self.cfg, it).replace("_", "__")),
                          "enabled": GLib.Variant("b", bool(it.get("enabled", True))),
                          "visible": GLib.Variant("b", True)}
             items.append((i, props, it.get("command", "")))
@@ -1196,7 +1219,7 @@ class SniTray(Core):
     def show_menu(self):
         if self.menu_busy:
             return
-        entries = [(it["label"], it.get("command", "")) for it in self.cfg["menu"]
+        entries = [(menu_label(self.cfg, it), it.get("command", "")) for it in self.cfg["menu"]
                    if not it.get("separator") and it.get("enabled", True) and it.get("label")]
         if not entries or not shutil.which("fuzzel"):
             notify("Для меню нужен fuzzel (sudo apt install fuzzel) или menu_ui = \"panel\" в osk.toml")
@@ -1365,7 +1388,8 @@ class LayerTray(Core):
         if fs.get("on"):
             sc = float(fs.get("scale", 0.5))
             if fs.get("collapsed"):
-                return (int(fs.get("x", 24)), int(fs.get("y", 24)), 40, 40)
+                bt = int(self.cfg.get("float_button", 40))
+                return (int(fs.get("x", 24)), int(fs.get("y", 24)), bt, bt)
             return (int(fs.get("x", 24)), int(fs.get("y", 24)), int(sw * sc), max(90, int(int(self.cfg["kbd_h"]) * sc)))
         kh = int(self.cfg["kbd_h"])
         return (0, sh - self.panel_h() - kh, sw, kh)
@@ -1588,7 +1612,7 @@ class LayerTray(Core):
             if it.get("separator"):
                 box.pack_start(Gtk.Separator(), False, False, 0)
                 continue
-            b = Gtk.Button(label=it.get("label", "?"))
+            b = Gtk.Button(label=menu_label(self.cfg, it))
             b.set_relief(Gtk.ReliefStyle.NONE)
             b.get_child().set_xalign(0)
             b.set_sensitive(bool(it.get("enabled", True)))
