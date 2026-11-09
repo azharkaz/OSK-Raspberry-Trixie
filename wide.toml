@@ -72,6 +72,8 @@ s = "Find"
 type = "Code"
 code = "KEY_F"
 mod = "Ctrl"
+hold_code = "KEY_H"                  # удержание = «Заменить» (Ctrl+H)
+hold_mod = "Ctrl"
 scheme = 1
 
 [keys.SelAll]
@@ -88,6 +90,8 @@ s = "Save"
 type = "Code"
 code = "KEY_S"
 mod = "Ctrl"
+hold_code = "KEY_S"                  # удержание = «Сохранить как» (Ctrl+Shift+S)
+hold_mod = "Ctrl | Shift"
 scheme = 1
 
 [keys.Open]

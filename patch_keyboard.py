@@ -1010,6 +1010,25 @@ def patch_sym(c, h):
              "    }\n" + mm.group(2), "osk_fire_hold (sym)", hint="hold_pending")
     return c, h, True
 
+
+# ---------------- плавающая клавиатура, часть 3: журнал нажатий на кружок (osk-patch: float3) ----------------
+M_FLOAT3 = "/* osk-patch: float3 */"
+
+
+def patch_float3(c, h, m):
+    """Короткие записи в журнал wvkbd про нажатия на кружок: помогают понять, что приходит от VNC-клиента (палец, мышь)."""
+    if M_FLOAT3 in m:
+        return c, h, m, False
+    if M_FLOAT2 not in m:
+        raise ValueError("«float3»: сначала должен примениться патч float2")
+    m = sub1(m, r"(    fl_pbtn = via_pointer \? fl_btn_code : 0x110;[^\n]*\n)",
+             lambda mm: mm.group(1) + "    fprintf(stderr, \"osk-float: нажатие кнопка=0x%x указатель=%d (%d,%d) rel=%d\\n\", fl_pbtn, via_pointer, x, y, fl_rel_ptr != NULL);   "
+             + M_FLOAT3 + "\n", "float3 press", hint="fl_pbtn = via_pointer")
+    m = sub1(m, r"(    fl_drag = 0;\n)(    if \(fl_pbtn == 0x111\))",
+             lambda mm: mm.group(1) + "    fprintf(stderr, \"osk-float: отпускание кнопка=0x%x сдвинуто=%d rel=%d relseen=%d mot=%d acc=%.0f,%.0f\\n\", fl_pbtn, fl_moved, fl_relmode, fl_relseen, fl_nloc, fl_accx, fl_accy);   "
+             + M_FLOAT3 + "\n" + mm.group(2), "float3 release", hint="fl_pbtn == 0x111")
+    return c, h, m, True
+
 def main():
     if not KC.exists() or not KH.exists() or not KM.exists():
         sys.exit("patch_keyboard: нет keyboard.c/keyboard.h/main.c, запускай из каталога wvkbd")
@@ -1022,9 +1041,10 @@ def main():
         c, h, ch_sym = patch_sym(c, h)
         c, h, m, ch_float = patch_float(c, h, m)
         c, h, m, ch_float2 = patch_float2(c, h, m)
+        c, h, m, ch_float3 = patch_float3(c, h, m)
     except ValueError as e:
         sys.exit(f"patch_keyboard: {e}\nФайлы не изменены. Версия wvkbd отличается - пришли соответствующий кусок кода.")
-    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float or ch_float2 or ch_sym):
+    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float or ch_float2 or ch_float3 or ch_sym):
         print("patch_keyboard: все правки уже применены")
         return
     for f in (KC, KH, KM):
@@ -1033,7 +1053,7 @@ def main():
     KC.write_text(c, encoding="utf-8")
     KH.write_text(h, encoding="utf-8")
     KM.write_text(m, encoding="utf-8")
-    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("sym", ch_sym), ("float", ch_float), ("float2", ch_float2)) if ok]
+    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("sym", ch_sym), ("float", ch_float), ("float2", ch_float2), ("float3", ch_float3)) if ok]
     print("patch_keyboard: применено: " + ", ".join(done))
 
 

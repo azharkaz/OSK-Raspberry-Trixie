@@ -24,6 +24,7 @@
 """
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -51,7 +52,7 @@ FLOAT_DEFAULTS = {
     "x": 24,                           # положение по умолчанию (px от левого верхнего угла)
     "y": 24,
     "double_click_ms": 350,            # окно двойного клика на кружке; 0 - выкл. (тогда клик сворачивает/разворачивает сразу)
-    "right_click": "~/.local/bin/osk-tray menu",                 # ПКМ по кружку (состояние клавиатуры не меняется)
+    "right_click": "~/.local/bin/osk-tray menu at {x} {y} {w} {h}",   # ПКМ по кружку: меню у кружка ({x} {y} {w} {h} - его положение)
     "double_click": "~/.local/bin/clipd pick --paste --toggle",  # двойной ЛКМ: история буфера
     "middle_click": "~/.local/bin/clipd tpl --toggle",           # СКМ: шаблоны
 }
@@ -327,6 +328,18 @@ def cmd_layout(kb, arg):
         cmd_layer(kb, target, quiet=True)     # значка нет, подстраиваем слой сами
 
 
+def screen_size():
+    """Размер экрана (ширина, высота): wlr-randr, иначе 1920x1080."""
+    try:
+        out = subprocess.run(["wlr-randr"], capture_output=True, text=True, timeout=3).stdout
+        m = re.search(r"(\d+)x(\d+) px.*?current", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 1920, 1080
+
+
 def cmd_float(kb, colors, a):
     sub = a[0] if a else "status"
     fs = fstate()
@@ -359,6 +372,23 @@ def cmd_float(kb, colors, a):
         fs["scale"] = max(float(FLT["min_scale"]), min(1.0, round(sc, 3)))
         apply(restart=cur)
         print("размер плавающей:", fs["scale"], "(доля от полной)")
+    elif sub == "pos":                                  # положение: tl tr bl br c или X Y (для сенсорных клиентов, где не перетащить)
+        arg = a[1] if len(a) > 1 else ""
+        sw, sh = screen_size()
+        w = int(float(fs.get("scale", FLT["scale"])) * sw)
+        m = 24
+        spots = {"tl": (m, m), "tr": (sw - w - m, m), "bl": (m, sh - 200), "br": (sw - w - m, sh - 200),
+                 "c": ((sw - w) // 2, (sh - 150) // 2)}
+        try:
+            if arg in spots:
+                fs["x"], fs["y"] = spots[arg]
+            else:
+                fs["x"], fs["y"] = int(a[1]), int(a[2])
+        except (ValueError, IndexError):
+            sys.exit("osk float pos tl|tr|bl|br|c  или  osk float pos X Y")
+        fs["collapsed"] = bool(fs.get("collapsed"))
+        apply(restart=cur)
+        print("положение плавающей:", fs["x"], fs["y"])
     elif sub == "reset":
         fs.update(x=FLT["x"], y=FLT["y"], collapsed=False, scale=FLT["scale"])
         apply(restart=cur)
@@ -367,7 +397,7 @@ def cmd_float(kb, colors, a):
         print("режим:", "плавающая" if cur else "полная", "| размер:", fs.get("scale", FLT["scale"]),
               "| позиция:", fs.get("x", FLT["x"]), fs.get("y", FLT["y"]), "| свёрнута:", bool(fs.get("collapsed")))
     else:
-        sys.exit("osk float on|off|toggle|size up|down|N|reset|status")
+        sys.exit("osk float on|off|toggle|size up|down|N|pos tl|tr|bl|br|c|X Y|reset|status")
 
 
 def cmd_float_event(a):
@@ -381,6 +411,7 @@ def cmd_float_event(a):
     if what in ("right", "double", "middle"):          # клики по кружку: команды из [floating], состояние не трогаем
         cmd = FLT.get({"right": "right_click", "double": "double_click", "middle": "middle_click"}[what], "")
         if cmd:
+            cmd = cmd.format(x=x, y=y, w=int(FLT["button"]), h=int(FLT["button"]))
             subprocess.Popen(["sh", "-c", os.path.expanduser(cmd).replace("$HOME", str(HOME))], start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return

@@ -31,7 +31,7 @@ x = 24                                           # положение по ум�
 y = 24
 double_click_ms = 350                            # окно двойного клика на кружке (мс); 0 - выкл., тогда клик сворачивает/разворачивает сразу
 # Клики по кружку (в левом верхнем углу клавиатуры или свёрнутому): состояние клавиатуры при них не меняется
-right_click  = "~/.local/bin/osk-tray menu"      # правая кнопка: меню (то же, что у значка языка и кнопки Menu)
+right_click  = "~/.local/bin/osk-tray menu at {x} {y} {w} {h}"   # правая кнопка: меню у кружка ({x} {y} {w} {h} - его положение и размер)
 double_click = "~/.local/bin/clipd pick --paste --toggle"   # двойной клик левой: история буфера
 middle_click = "~/.local/bin/clipd tpl --toggle" # средняя: шаблоны
 
@@ -185,6 +185,26 @@ command = "~/.local/bin/osk float size down"
 [[tray.menu]]
 label = "Плавающая: размер по умолчанию"
 command = "~/.local/bin/osk float reset"
+
+[[tray.menu]]
+label = "Плавающая: в левый верхний угол"
+command = "~/.local/bin/osk float pos tl"
+
+[[tray.menu]]
+label = "Плавающая: в правый верхний угол"
+command = "~/.local/bin/osk float pos tr"
+
+[[tray.menu]]
+label = "Плавающая: в левый нижний угол"
+command = "~/.local/bin/osk float pos bl"
+
+[[tray.menu]]
+label = "Плавающая: в правый нижний угол"
+command = "~/.local/bin/osk float pos br"
+
+[[tray.menu]]
+label = "Плавающая: по центру"
+command = "~/.local/bin/osk float pos c"
 
 [[tray.menu]]
 separator = true

@@ -756,6 +756,12 @@ class Core:
                 self.place()
             elif words[0] == "menu":
                 self.menu_origin = "kbd"          # вызвано клавишей Menu на экранной клавиатуре: меню рядом с ней
+                self.menu_at = None
+                if len(words) >= 6 and words[1] == "at":      # menu at X Y W H: меню у заданного прямоугольника (кружок плавающей)
+                    try:
+                        self.menu_at = tuple(int(v) for v in words[2:6])
+                    except ValueError:
+                        self.menu_at = None
                 self.show_menu()
             elif words[0] == "refocus":
                 self.top.refocus()
@@ -907,7 +913,7 @@ class Core:
     def tooltip_text(self):
         osk = "показана" if self.osk_shown else "скрыта"
         return (f"Раскладка: {self.layout}\nЭкранная клавиатура: {osk}\n"
-                "ЛКМ - сменить язык, двойной клик - показать/скрыть, ПКМ - меню")
+                "ЛКМ - сменить язык\nдвойной ЛКМ - показать/скрыть клавиатуру\nСКМ - история буфера\nПКМ - меню")
 
     # ---- действия ----
     def focus_restore(self, delay=40):
@@ -1633,7 +1639,14 @@ class LayerTray(Core):
         kr = self.kbd_rect()
         overlap = kr is not None and not (self.x + self.size <= kr[0] or self.x >= kr[0] + kr[2] or
                                           iy + self.size <= kr[1] or iy >= kr[1] + kr[3])
-        if kr is not None and origin == "kbd":              # вызвано клавишей Menu: над клавиатурой, у её правого края
+        at, self.menu_at = getattr(self, "menu_at", None), None
+        if at is not None:                                  # вызвано кружком плавающей: меню прямо у кружка
+            ax, ay, aw, ah = at
+            left = max(4, min(ax, sw - mw - 4))
+            top = ay + ah + gap
+            if top + mh > sh - 4:                           # снизу нет места - над кружком
+                top = ay - mh - gap
+        elif kr is not None and origin == "kbd":            # вызвано клавишей Menu: над клавиатурой, у её правого края
             left = max(4, min(kr[0] + kr[2] - mw, sw - mw - 4))
             top = kr[1] - mh - gap
             if top < 4:                                     # сверху нет места - под клавиатурой
