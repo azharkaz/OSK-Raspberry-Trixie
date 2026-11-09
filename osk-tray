@@ -156,9 +156,13 @@ DEFAULTS = {
 DEFAULT_MENU = [
     {"label": "Открыть историю буфера обмена", "command": "~/.local/bin/clipd pick --paste"},
     {"label": "Показать / скрыть клавиатуру", "command": "~/.local/bin/osk toggle"},
-    {"label": "Плавающая / полная клавиатура", "command": "~/.local/bin/osk float toggle"},
-    {"label": "Плавающая: крупнее", "command": "~/.local/bin/osk float size up"},
-    {"label": "Плавающая: мельче", "command": "~/.local/bin/osk float size down"},
+    {"label": "Плавающая:", "items": [
+        {"label": "Плавающая / полная клавиатура", "command": "~/.local/bin/osk float toggle", "state": "float",
+         "label_on": "\u2705 Плавающая клавиатура вкл", "label_off": "\u2b1c Плавающая клавиатура выкл"},
+        {"label": "Крупнее", "command": "~/.local/bin/osk float size up"},
+        {"label": "Мельче", "command": "~/.local/bin/osk float size down"},
+        {"label": "Размер по умолчанию", "command": "~/.local/bin/osk float reset"},
+    ]},
     {"separator": True},
     {"label": "Перезапустить панель задач", "command": "~/.local/bin/osk-tray panel restart"},
     {"label": "Сторож панели: вкл / выкл", "command": "~/.local/bin/osk-tray panel watch toggle"},
@@ -424,6 +428,23 @@ def menu_label(cfg, it):
     else:
         return it.get("label", "?")
     return it.get("label_on" if on else "label_off") or it.get("label", "?")
+
+
+def menu_flat(cfg):
+    """Меню без вложенных пунктов: для fuzzel и меню панели подпункты идут обычными строками «Раздел: пункт»."""
+    out = []
+    for it in cfg["menu"]:
+        subs = it.get("items")
+        if not subs:
+            out.append(it)
+            continue
+        head = str(it.get("label", "")).rstrip(":").strip()
+        for sub in subs:
+            if sub.get("separator"):
+                continue
+            out.append({**{k: v for k, v in sub.items() if k not in ("state", "label_on", "label_off")},
+                        "label": f"{head}: {menu_label(cfg, sub)}"})
+    return out
 
 
 def cmd_panel(argv):
@@ -1032,7 +1053,7 @@ class SniTray(Core):
 
     def build_menu_items(self):
         items = []
-        for i, it in enumerate(self.cfg["menu"], start=1):
+        for i, it in enumerate(menu_flat(self.cfg), start=1):
             if it.get("separator"):
                 props = {"type": GLib.Variant("s", "separator")}
             else:
@@ -1117,7 +1138,7 @@ class SniTray(Core):
     # ---- меню dbusmenu ----
     def build_menu_items(self):
         items = []
-        for i, it in enumerate(self.cfg["menu"], start=1):
+        for i, it in enumerate(menu_flat(self.cfg), start=1):
             if it.get("separator"):
                 props = {"type": GLib.Variant("s", "separator")}
             else:
@@ -1225,7 +1246,7 @@ class SniTray(Core):
     def show_menu(self):
         if self.menu_busy:
             return
-        entries = [(menu_label(self.cfg, it), it.get("command", "")) for it in self.cfg["menu"]
+        entries = [(menu_label(self.cfg, it), it.get("command", "")) for it in menu_flat(self.cfg)
                    if not it.get("separator") and it.get("enabled", True) and it.get("label")]
         if not entries or not shutil.which("fuzzel"):
             notify("Для меню нужен fuzzel (sudo apt install fuzzel) или menu_ui = \"panel\" в osk.toml")
@@ -1618,13 +1639,10 @@ class LayerTray(Core):
             if it.get("separator"):
                 box.pack_start(Gtk.Separator(), False, False, 0)
                 continue
-            b = Gtk.Button(label=menu_label(self.cfg, it))
-            b.set_relief(Gtk.ReliefStyle.NONE)
-            b.get_child().set_xalign(0)
-            b.set_sensitive(bool(it.get("enabled", True)))
-            b.set_focus_on_click(False)
-            b.connect("clicked", self.menu_item, it.get("command", ""))
-            box.pack_start(b, False, False, 0)
+            if it.get("items"):                          # раздел с вложенными пунктами: щёлкнули - раскрылся/свернулся
+                self.add_section(box, it)
+                continue
+            box.pack_start(self.menu_button(it), False, False, 0)
         mw = int(self.cfg["menu_width"])
         win = self.make_window(mw, 10, top=0, left=0)
         win.add(box)
@@ -1640,27 +1658,35 @@ class LayerTray(Core):
         overlap = kr is not None and not (self.x + self.size <= kr[0] or self.x >= kr[0] + kr[2] or
                                           iy + self.size <= kr[1] or iy >= kr[1] + kr[3])
         at, self.menu_at = getattr(self, "menu_at", None), None
+        be = None                                           # нижняя кромка меню, если оно «стоит» над чем-то (тогда растёт вверх)
         if at is not None:                                  # вызвано кружком плавающей: меню прямо у кружка
             ax, ay, aw, ah = at
             left = max(4, min(ax, sw - mw - 4))
             top = ay + ah + gap
             if top + mh > sh - 4:                           # снизу нет места - над кружком
                 top = ay - mh - gap
+                be = top + mh
         elif kr is not None and origin == "kbd":            # вызвано клавишей Menu: над клавиатурой, у её правого края
             left = max(4, min(kr[0] + kr[2] - mw, sw - mw - 4))
             top = kr[1] - mh - gap
+            be = top + mh
             if top < 4:                                     # сверху нет места - под клавиатурой
                 top = kr[1] + kr[3] + gap
+                be = None
         elif kr is not None and overlap:                    # значок под клавиатурой: меню выше её верхней кромки
             top = kr[1] - mh - gap
+            be = top + mh
             if top < 4:
                 top = kr[1] + kr[3] + gap
+                be = None
         else:
             top = iy - mh - gap if iy + self.size / 2 > sh / 2 else iy + self.size + gap
+            be = top + mh if iy + self.size / 2 > sh / 2 else None
         top = max(4, min(top, sh - mh - 4))
         E = GtkLayerShell.Edge
         GtkLayerShell.set_margin(win, E.TOP, int(top))
         GtkLayerShell.set_margin(win, E.LEFT, int(left))
+        self.menu_geom = {"win": win, "box": box, "mw": mw, "top": top, "be": be}
         self.menu_wins = [catch, win]
         catch.show_all()                                 # сначала ловушка; меню показываем чуть позже, чтобы оно легло выше
 
@@ -1670,6 +1696,56 @@ class LayerTray(Core):
             return False
 
         GLib.timeout_add(80, show_win)
+
+    def menu_button(self, it, indent=0):
+        b = Gtk.Button(label=menu_label(self.cfg, it))
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.get_child().set_xalign(0)
+        b.set_sensitive(bool(it.get("enabled", True)))
+        b.set_focus_on_click(False)
+        if indent:
+            b.set_margin_start(indent)
+        b.connect("clicked", self.menu_item, it.get("command", ""))
+        return b
+
+    def add_section(self, box, it):
+        title = str(it.get("label", "")).rstrip(":").strip()
+        head = Gtk.Button(label="\u25b8  " + title)
+        head.set_relief(Gtk.ReliefStyle.NONE)
+        head.get_child().set_xalign(0)
+        head.set_focus_on_click(False)
+        sub = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        for s in it["items"]:
+            if s.get("separator"):
+                sub.pack_start(Gtk.Separator(), False, False, 0)
+            else:
+                sub.pack_start(self.menu_button(s, indent=18), False, False, 0)
+        sub.show_all()                                   # дети показаны заранее, сам раздел скрыт до щелчка
+        sub.set_no_show_all(True)
+        sub.hide()
+
+        def toggle(_b):
+            opened = not sub.get_visible()
+            sub.set_visible(opened)
+            head.get_child().set_text(("\u25be  " if opened else "\u25b8  ") + title)
+            GLib.idle_add(self.menu_fit)
+
+        head.connect("clicked", toggle)
+        box.pack_start(head, False, False, 0)
+        box.pack_start(sub, False, False, 0)
+
+    def menu_fit(self):
+        """После раскрытия раздела меню пересчитать высоту и положение (выросшее вниз или вверх от своей привязки)."""
+        g = getattr(self, "menu_geom", None)
+        if not g or g["win"] not in self.menu_wins:
+            return False
+        g["win"].resize(g["mw"], 1)
+        mh = g["box"].get_preferred_height()[1]
+        sh = self.screen_size()[1]
+        top = g["be"] - mh if g["be"] is not None else g["top"]
+        top = max(4, min(top, sh - mh - 4))
+        GtkLayerShell.set_margin(g["win"], GtkLayerShell.Edge.TOP, int(top))
+        return False
 
     def catch_pressed(self, widget, ev):
         dbg("меню: клик мимо, закрываю")

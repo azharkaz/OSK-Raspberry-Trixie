@@ -168,42 +168,48 @@ label = "Показать / скрыть клавиатуру"
 command = "~/.local/bin/osk toggle"
 
 [[tray.menu]]
+label = "Плавающая:"                             # раздел с выпадающими пунктами (items); щёлкнули - раскрылся
+
+[[tray.menu.items]]
 label = "Плавающая / полная клавиатура"
 state = "float"                                  # подпись показывает состояние: label_on / label_off
 label_on = "✅ Плавающая клавиатура вкл"
 label_off = "⬜ Плавающая клавиатура выкл"
 command = "~/.local/bin/osk float toggle"
 
-[[tray.menu]]
-label = "Плавающая: крупнее"
+[[tray.menu.items]]
+label = "Крупнее"
 command = "~/.local/bin/osk float size up"
 
-[[tray.menu]]
-label = "Плавающая: мельче"
+[[tray.menu.items]]
+label = "Мельче"
 command = "~/.local/bin/osk float size down"
 
-[[tray.menu]]
-label = "Плавающая: размер по умолчанию"
+[[tray.menu.items]]
+label = "Размер по умолчанию"
 command = "~/.local/bin/osk float reset"
 
-[[tray.menu]]
-label = "Плавающая: в левый верхний угол"
+[[tray.menu.items]]
+separator = true
+
+[[tray.menu.items]]
+label = "В левый верхний угол"
 command = "~/.local/bin/osk float pos tl"
 
-[[tray.menu]]
-label = "Плавающая: в правый верхний угол"
+[[tray.menu.items]]
+label = "В правый верхний угол"
 command = "~/.local/bin/osk float pos tr"
 
-[[tray.menu]]
-label = "Плавающая: в левый нижний угол"
+[[tray.menu.items]]
+label = "В левый нижний угол"
 command = "~/.local/bin/osk float pos bl"
 
-[[tray.menu]]
-label = "Плавающая: в правый нижний угол"
+[[tray.menu.items]]
+label = "В правый нижний угол"
 command = "~/.local/bin/osk float pos br"
 
-[[tray.menu]]
-label = "Плавающая: по центру"
+[[tray.menu.items]]
+label = "По центру"
 command = "~/.local/bin/osk float pos c"
 
 [[tray.menu]]
