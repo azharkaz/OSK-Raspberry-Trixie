@@ -19,6 +19,7 @@
   osk float size up|down|0.6   размер плавающей (доля от полной, пропорционально; шрифт не меняется)
   osk float reset              вернуть положение и размер плавающей по умолчанию
   osk float status             текущее состояние плавающего режима
+  osk settings                 окно настроек со всеми параметрами (Применить / Отмена)
 
 Конфиг: $OSK_CONFIG или ~/.config/osk/osk.toml
 """
@@ -48,6 +49,8 @@ FLOAT_DEFAULTS = {
     "min_scale": 0.25,
     "button": 40,                      # размер круглой кнопки, когда клавиатура свёрнута, px
     "font": "",                        # шрифт плавающей; пусто = как у полной (keyboard.font). Размер букв не масштабируется
+    "alpha": -1,                       # прозрачность плавающей 0..255; -1 = как у основной (keyboard.alpha)
+    "colors": {},                      # свои цвета плавающей ([floating.colors]); что не задано - как у основной
     "layers": ["widefen", "widefru"],  # слои плавающей (с круглой кнопкой в углу)
     "x": 24,                           # положение по умолчанию (px от левого верхнего угла)
     "y": 24,
@@ -137,8 +140,11 @@ def active_layers(kb):
 
 def build_cmd(kb, colors, hidden):
     fl = float_on()
+    alpha = FLT["alpha"] if fl and int(FLT.get("alpha", -1)) >= 0 else kb["alpha"]
+    if fl and isinstance(FLT.get("colors"), dict):
+        colors = {**colors, **FLT["colors"]}
     c = [find_binary(kb), "-H", str(kb["height"]), "-L", str(kb["landscape_height"]),
-         "--fn", (FLT["font"] if fl and FLT["font"] else kb["font"]), "--alpha", str(kb["alpha"]), "-R", str(kb["rounding"])]
+         "--fn", (FLT["font"] if fl and FLT["font"] else kb["font"]), "--alpha", str(alpha), "-R", str(kb["rounding"])]
     if fl:
         fs = fstate()
         c += ["-l", ",".join(FLT["layers"]), "--landscape-layers", ",".join(FLT["layers"]),
@@ -530,6 +536,9 @@ def main():
         cmd_float(kb, colors, a[1:])
     elif cmd == "float-event":
         cmd_float_event(a[1:])
+    elif cmd == "settings":
+        sp = Path(__file__).resolve().parent / "osk-settings"
+        os.execv(sys.executable, [sys.executable, str(sp)] + a[1:])
     elif cmd == "layer":
         cmd_layer(kb, norm_layout(a[1] if len(a) > 1 else "").replace("TOGGLE", ""))
     else:

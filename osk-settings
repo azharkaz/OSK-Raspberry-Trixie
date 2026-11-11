@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""osk-settings - окно настроек: все параметры osk.toml, кнопки «Применить», «Отмена», «OK».
+
+  osk settings          открыть окно (то же: пункт «Настройки…» в меню значка)
+
+Как работает:
+  * читает osk.toml ($OSK_CONFIG или ~/.config/osk/osk.toml; ссылка разворачивается до настоящего файла);
+  * при «Применить» меняет в файле ТОЛЬКО изменённые значения, комментарии и остальной текст остаются как были;
+    перед первой записью делается копия osk.toml.bak рядом с файлом;
+  * сама перезапускает то, что нужно: клавиатуру (osk restart), значок (osk-tray restart), clipd watch;
+  * пустое поле цвета = «не задано» (берётся цвет из сборки / у плавающей - как у основной).
+Окно рисуется слоем поверх клавиатуры (gtk-layer-shell), поэтому клавиатуру не перекрывает; если слоя нет - обычное окно.
+Проверка без окна:  osk-settings --selftest
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+HOME = Path.home()
+CONF = Path(os.environ.get("OSK_CONFIG", HOME / ".config/osk/osk.toml"))
+RUN = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+
+COLOR9 = [
+    ("bg", "Фон клавиатуры"), ("fg", "Обычные клавиши"), ("fg_sp", "Служебные клавиши"),
+    ("press", "Нажатая клавиша"), ("press_sp", "Нажатая служебная"), ("swipe", "Свайп"),
+    ("swipe_sp", "Свайп служебной"), ("text", "Текст клавиш"), ("text_sp", "Текст служебных"),
+]
+
+# (раздел, ключ, подпись, тип, значение по умолчанию, параметры, подсказка)
+# типы: int(lo,hi) float(lo,hi,step) bool str path color hcolor choice(список) alpha alpha_f list
+T = []
+
+
+def add(tab, *rows):
+    T.append((tab, list(rows)))
+
+
+add("Основная клавиатура",
+    ("keyboard", "height", "Высота (портрет), px", "int", 300, (50, 2000), ""),
+    ("keyboard", "landscape_height", "Высота (ландшафт), px", "int", 300, (50, 2000), ""),
+    ("keyboard", "font", "Шрифт", "str", "Sans 12", None, "название и размер, например «DejaVu Sans Bold 12»; кириллица должна быть в шрифте"),
+    ("keyboard", "alpha", "Прозрачность", "alpha", 235, None, "0 - прозрачная, 255 - непрозрачная"),
+    ("keyboard", "rounding", "Скругление клавиш", "int", 6, (0, 50), ""),
+    ("keyboard", "non_exclusive", "Лежит поверх окон и панели", "bool", True, None, "выкл - клавиатура сдвигает окна"),
+    ("keyboard", "start_hidden", "Запускать свёрнутой", "bool", False, None, ""),
+    ("keyboard", "layers", "Слои (раскладки)", "list", ["wideen", "wideru"], None, "через запятую"),
+    ("keyboard", "landscape_layers", "Слои в ландшафте", "list", ["wideen", "wideru"], None, "через запятую"),
+    ("keyboard", "source_dir", "Папка исходников wvkbd", "path", "~/wvkbd", None, ""),
+    ("keyboard", "binary", "Путь к wvkbd-wide", "path", "", None, "пусто = искать автоматически"),
+    *[("colors", k, "Цвет: " + n, "color", "", None, "rrggbb или rrggbbaa; пусто = из сборки") for k, n in COLOR9],
+)
+add("Плавающая",
+    ("floating", "start", "Начинать в плавающем режиме", "bool", False, None, ""),
+    ("floating", "scale", "Размер (доля от полной)", "float", 0.5, (0.1, 1.0, 0.05), ""),
+    ("floating", "step", "Шаг «Крупнее / Мельче»", "float", 1.15, (1.01, 2.0, 0.01), ""),
+    ("floating", "min_scale", "Минимальный размер", "float", 0.25, (0.05, 1.0, 0.05), ""),
+    ("floating", "button", "Диаметр кружка, px", "int", 40, (16, 200), ""),
+    ("floating", "alpha", "Прозрачность плавающей", "alpha_f", -1, None, "отдельно от основной; «как у основной» - общая"),
+    ("floating", "font", "Шрифт плавающей", "str", "", None, "пусто = как у основной"),
+    ("floating", "layers", "Слои плавающей", "list", ["widefen", "widefru"], None, "через запятую"),
+    ("floating", "x", "Положение X, px", "int", 24, (0, 20000), "стартовое, дальше запоминается"),
+    ("floating", "y", "Положение Y, px", "int", 24, (0, 20000), ""),
+    ("floating", "double_click_ms", "Двойной клик на кружке, мс", "int", 350, (0, 3000), "0 - выкл."),
+    ("floating", "right_click", "ПКМ по кружку", "str", "~/.local/bin/osk-tray menu at {x} {y} {w} {h}", None, "команда"),
+    ("floating", "double_click", "Двойной ЛКМ по кружку", "str", "~/.local/bin/clipd pick --paste --toggle", None, "команда"),
+    ("floating", "middle_click", "СКМ по кружку", "str", "~/.local/bin/clipd tpl --toggle", None, "команда"),
+    *[("floating.colors", k, "Цвет плавающей: " + n, "color", "", None, "пусто = как у основной") for k, n in COLOR9],
+)
+add("Значок",
+    ("tray", "mode", "Режим", "choice", "layer", ["layer", "sni", "auto"], "layer - плавающий значок; sni - в области уведомлений"),
+    ("tray", "icon_size", "Размер значка, px", "int", 28, (12, 200), ""),
+    ("tray", "icon_drag", "Значок можно перетаскивать", "bool", True, None, ""),
+    ("tray", "icon_x", "Положение X (-1 авто)", "int", -1, (-1, 20000), ""),
+    ("tray", "icon_y", "Положение Y (-1 авто)", "int", -1, (-1, 20000), ""),
+    ("tray", "icon_margin_right", "Отступ справа по умолчанию", "int", 12, (0, 2000), ""),
+    ("tray", "icon_margin_top", "Отступ сверху по умолчанию", "int", 12, (0, 2000), ""),
+    ("tray", "double_click_ms", "Двойной клик по значку, мс", "int", 1200, (0, 5000), "одиночный клик срабатывает с такой задержкой"),
+    ("tray", "left_click", "Левый клик", "str", "layout", None, "layout = сменить язык, или своя команда"),
+    ("tray", "double_click", "Двойной клик", "str", "~/.local/bin/osk toggle", None, "пусто = отключить"),
+    ("tray", "middle_click", "Средний клик", "str", "~/.local/bin/clipd pick --paste --toggle", None, ""),
+    ("tray", "sync_layer", "Слой клавиатуры следует за языком системы", "bool", True, None, ""),
+    ("tray", "restore_focus", "Возвращать фокус прежнему окну", "bool", True, None, ""),
+    ("tray", "watchdog", "Сторож значка и клавиатуры", "bool", True, None, ""),
+    ("tray", "icon_refresh_s", "Пересоздавать значок раз в, с", "int", 20, (0, 3600), "0 - выкл."),
+    ("tray", "toggle_keys", "Клавиши смены раскладки", "list", ["KEY_LEFTALT", "KEY_LEFTSHIFT"], None, "через запятую"),
+    ("tray", "menu_width", "Ширина меню, px", "int", 300, (150, 1000), ""),
+    ("tray", "menu_gap", "Зазор меню, px", "int", 6, (0, 200), ""),
+    ("tray", "menu_bg", "Цвет фона меню", "color", "262626", None, ""),
+    ("tray", "menu_fg", "Цвет текста меню", "color", "f0f0f0", None, ""),
+    ("tray", "menu_hover", "Цвет выбранного пункта", "color", "3d6fd8", None, ""),
+)
+add("Панель задач",
+    ("tray", "panel_watchdog", "Сторож панели", "bool", True, None, "если панель пропала - поднять"),
+    ("tray", "panel_process", "Процесс панели", "str", "xfce4-panel", None, ""),
+    ("tray", "panel_start", "Команда запуска панели", "str", "xfce4-panel", None, ""),
+    ("tray", "panel_check_s", "Период проверки, с", "int", 5, (1, 600), ""),
+    ("tray", "panel_grace_s", "Ждать перед запуском, с", "int", 8, (0, 600), ""),
+    ("tray", "panel_max_restarts", "Макс. перезапусков за 5 минут", "int", 3, (0, 100), ""),
+    ("tray", "panel_height", "Высота панели, px", "int", 0, (0, 500), "0 = узнать автоматически"),
+    ("tray", "panel_ids", "app_id окон панели", "list", ["panel"], None, "через запятую"),
+)
+add("Буфер обмена",
+    ("clipboard", "device", "Имя устройства", "str", "raspi", None, "подпись в истории и имя файла clip_hist-<имя>.txt"),
+    ("clipboard", "sync_dir", "Папка истории (синхронизация)", "path", "~/Syncthing/Zametki_ALL/claude_bufer", None, ""),
+    ("clipboard", "max_entries", "Сколько записей хранить", "int", 500, (10, 100000), ""),
+    ("clipboard", "max_bytes", "Макс. размер записи, байт", "int", 100000, (100, 100000000), ""),
+    ("clipboard", "primary", "Писать и выделение мышью (PRIMARY)", "bool", False, None, ""),
+    ("clipboard", "paste_method", "Способ вставки", "choice", "uinput", ["uinput", "keys", "type"], "uinput - как от настоящей клавиатуры"),
+    ("clipboard", "paste_delay_ms", "Пауза перед вставкой, мс", "int", 350, (0, 5000), ""),
+    ("clipboard", "paste_mods", "Клавиши вставки", "list", ["ctrl"], None, "через запятую"),
+    ("clipboard", "paste_mods_terminal", "Клавиши вставки в терминале", "list", ["ctrl", "shift"], None, ""),
+    ("clipboard", "terminal_apps", "Какие окна считать терминалами", "list", [], None, "app_id через запятую"),
+)
+add("Окна истории",
+    ("clipboard", "font", "Шрифт", "str", "", None, "пусто = системный"),
+    ("clipboard", "font_size", "Размер шрифта, pt", "int", 0, (0, 60), "0 = системный; для VNC удобно 12-13"),
+    ("clipboard", "font_weight", "Начертание", "str", "", None, "пусто, bold или число 300-700"),
+    ("clipboard", "text_color", "Цвет текста", "hcolor", "#111111", None, "пусто = как в теме"),
+    ("clipboard", "font_hint", "Подгонка символов", "choice", "full", ["none", "slight", "medium", "full"], ""),
+    ("clipboard", "font_antialias", "Сглаживание", "choice", "gray", ["gray", "subpixel", "none", "default"], ""),
+    ("clipboard", "window_width", "Ширина окна, px", "int", 700, (200, 4000), ""),
+    ("clipboard", "window_height", "Высота окна, px", "int", 540, (200, 4000), ""),
+    ("clipboard", "ui", "Вид окна", "choice", "gtk", ["gtk", "fuzzel"], ""),
+    ("clipboard", "include", "Какие файлы показывать", "list", ["*.txt"], None, "маски через запятую"),
+    ("clipboard", "exclude", "Какие скрыть", "list", [], None, "маски через запятую"),
+    ("clipboard", "show_empty_tabs", "Показывать пустые вкладки", "bool", False, None, ""),
+    ("clipboard", "rows_per_tab", "Записей на вкладке", "int", 200, (10, 5000), ""),
+    ("clipboard", "row_lines", "Строк в записи", "int", 4, (1, 50), ""),
+    ("clipboard", "refresh_ms", "Обновление списка, мс", "int", 1000, (100, 60000), ""),
+    ("clipboard", "close_on_focus_out", "Закрывать при потере фокуса", "bool", True, None, ""),
+)
+add("Шаблоны",
+    ("clipboard", "templates_dir", "Папка шаблонов", "path", "", None, "пусто = <папка истории>/templates"),
+    ("clipboard", "templates_exts", "Расширения файлов", "list", ["txt", ""], None, "через запятую; \"\" (две кавычки) = файлы без расширения"),
+    ("clipboard", "templates_action", "Действие при выборе", "choice", "paste", ["paste", "copy"], "paste - вставить, copy - в буфер"),
+    ("clipboard", "templates_strip_newline", "Убирать перевод строки в конце", "bool", True, None, ""),
+    ("clipboard", "templates_restore_clipboard", "Возвращать прежний буфер", "bool", True, None, ""),
+    ("clipboard", "templates_restore_ms", "Возврат буфера через, мс", "int", 600, (0, 10000), ""),
+    ("clipboard", "templates_export_dir", "Папка экспорта (jbak2)", "path", "~/Syncthing/jbak2/templates/trixie", None, ""),
+    ("clipboard", "templates_export_strip_ext", "При экспорте убирать .txt", "bool", True, None, ""),
+    ("clipboard", "templates_export_strip_newline", "При экспорте убирать перевод строки", "bool", True, None, ""),
+    ("clipboard", "templates_export_prune", "Удалять в экспорте лишнее", "bool", True, None, ""),
+)
+
+RESTART_KB = {"keyboard", "floating", "floating.colors", "colors"}
+WATCH_KEYS = {"device", "sync_dir", "max_entries", "max_bytes", "primary"}
+
+
+# ---------------------------------------------------------------- правка TOML с сохранением комментариев
+def split_val(rest):
+    """'"a # b"  # note' -> ('"a # b"', '  # note'); значение отделяется от комментария с учётом кавычек."""
+    q = None
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if q:
+            if ch == "\\" and q == '"':
+                i += 2
+                continue
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            j = i
+            while j > 0 and rest[j - 1] in " \t":
+                j -= 1
+            return rest[:j], rest[j:]
+        i += 1
+    return rest.rstrip(), ""
+
+
+def fmt(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(round(v, 6))
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ", ".join(fmt(x) for x in v) + "]"
+    raise TypeError(v)
+
+
+HDR = re.compile(r"^\s*\[([^\[\]]+)\]\s*(#.*)?$")
+ANYHDR = re.compile(r"^\s*\[")
+
+
+def section_range(lines, name):
+    start = None
+    for i, ln in enumerate(lines):
+        m = HDR.match(ln)
+        if m and m.group(1).strip() == name:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if ANYHDR.match(lines[j]):
+            end = j
+            break
+    return start, end
+
+
+def set_value(lines, section, key, value):
+    """value=None - убрать (закомментировать) ключ. Меняет lines на месте."""
+    rng = section_range(lines, section)
+    keyre = re.compile(r"^(\s*)" + re.escape(key) + r"(\s*=\s*)(.*)$")
+    if rng is None:
+        if value is None:
+            return
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+        lines += ["", f"[{section}]", f"{key} = {fmt(value)}"]
+        return
+    s, e = rng
+    last = s
+    for i in range(s + 1, e):
+        ln = lines[i].rstrip("\n")
+        m = keyre.match(ln)
+        if m:
+            old, comment = split_val(m.group(3))
+            if value is None:
+                lines[i] = "# " + ln.lstrip()
+                return
+            new = fmt(value)
+            gap = comment[: len(comment) - len(comment.lstrip())] if comment else ""
+            if comment:
+                grow = len(new) - len(old)
+                gap = " " * max(1, len(gap) - grow)
+            lines[i] = m.group(1) + key + m.group(2) + new + gap + comment.lstrip()
+            return
+        if ln.strip() and not ln.lstrip().startswith("#"):
+            last = i
+    if value is None:
+        return
+    lines.insert(last + 1, f"{key} = {fmt(value)}")
+
+
+def get_cfg(data, section):
+    d = data
+    for p in section.split("."):
+        d = d.get(p, {}) if isinstance(d, dict) else {}
+    return d if isinstance(d, dict) else {}
+
+
+def parse_color(s):
+    s = (s or "").strip().lstrip("#")
+    if s == "":
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{6}([0-9a-fA-F]{2})?", s):
+        return s.lower()
+    raise ValueError(f"цвет «{s}»: нужно rrggbb или rrggbbaa")
+
+
+def strlist(s):
+    """«a, b, ""» -> ["a", "b", ""]; "" (две кавычки) - пустая строка, например «файлы без расширения»."""
+    return ["" if x.strip() == '""' else x.strip() for x in s.split(",") if x.strip()]
+
+
+def same(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            return abs(float(a) - float(b)) < 1e-9
+        except (TypeError, ValueError):
+            return False
+    return a == b
+
+
+def save_changes(path, changes):
+    """changes: [(section, key, value|None)]. Пишет файл (с копией .bak), возвращает затронутые разделы."""
+    real = Path(os.path.realpath(path))
+    text = real.read_text(encoding="utf-8") if real.exists() else ""
+    lines = text.split("\n")
+    for sec, key, val in changes:
+        set_value(lines, sec, key, val)
+    out = "\n".join(lines).rstrip("\n") + "\n"
+    tomllib.loads(out)                                    # проверка: файл остаётся корректным TOML
+    bak = real.with_name(real.name + ".bak")
+    if real.exists() and not getattr(save_changes, "_baked", False):
+        shutil.copy2(real, bak)
+        save_changes._baked = True
+    fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".osk-settings-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(out)
+    os.replace(tmp, real)
+    return {c[0] for c in changes}
+
+
+def selftest():
+    src = Path(os.environ.get("OSK_CONFIG") or CONF)
+    text = src.read_text(encoding="utf-8")
+    d0 = tomllib.loads(text)
+    lines = text.split("\n")
+    set_value(lines, "keyboard", "alpha", 200)
+    set_value(lines, "floating", "alpha", 120)
+    set_value(lines, "floating.colors", "bg", "112233")
+    set_value(lines, "clipboard", "text_color", "#222222")
+    set_value(lines, "clipboard", "include", ["*.txt", "a#b"])
+    set_value(lines, "tray", "menu_bg", None)
+    set_value(lines, "colors", "fg", "444444")
+    out = "\n".join(lines)
+    d = tomllib.loads(out)
+    assert d["keyboard"]["alpha"] == 200 and d["floating"]["alpha"] == 120
+    assert d["floating"]["colors"]["bg"] == "112233" and d["clipboard"]["text_color"] == "#222222"
+    assert d["clipboard"]["include"] == ["*.txt", "a#b"] and "menu_bg" not in d["tray"] and d["colors"]["fg"] == "444444"
+    assert d["tray"]["menu"] == d0["tray"]["menu"]
+    n_comments = sum(1 for ln in text.split("\n") if "#" in ln)
+    assert sum(1 for ln in lines if "#" in ln) >= n_comments, "комментарии потеряны"
+    print("selftest ok; комментариев", n_comments)
+    print("\n".join(ln for ln in lines if ln.startswith(("alpha", "text_color", "include", "# menu_bg", "[floating.colors]")) or ln.startswith("bg = \"112233")))
+
+
+# ---------------------------------------------------------------- окно
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+    try:
+        gi.require_version("GtkLayerShell", "0.1")
+        from gi.repository import GtkLayerShell
+    except (ValueError, ImportError):
+        GtkLayerShell = None
+
+    lock = open(RUN / "osk-settings.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("osk-settings: окно уже открыто")
+        return
+
+    try:
+        data = tomllib.loads(Path(os.path.realpath(CONF)).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        data = {}
+    except tomllib.TOMLDecodeError as e:
+        print(f"osk-settings: osk.toml не читается: {e}")
+        return 1
+
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_title("Настройки экранной клавиатуры")
+    scr = Gdk.Screen.get_default()
+    plain = os.environ.get("OSK_SETTINGS_PLAIN") or GtkLayerShell is None
+    if not plain:
+        try:
+            plain = not GtkLayerShell.is_supported()
+        except Exception:
+            plain = True
+    sw_, sh_ = 1280, 720
+    try:
+        mon = scr.get_display().get_monitor(0)
+        g = mon.get_geometry()
+        sw_, sh_ = g.width, g.height
+    except Exception:
+        pass
+    win.set_default_size(min(780, sw_ - 40), min(640, sh_ - 60))
+    win.set_size_request(min(780, sw_ - 40), min(640, sh_ - 60))
+    if not plain:
+        win.set_decorated(False)
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, "osk-settings")
+        GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+        if hasattr(GtkLayerShell, "set_keyboard_mode"):
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.ON_DEMAND)
+        else:
+            GtkLayerShell.set_keyboard_interactivity(win, True)
+        GtkLayerShell.set_exclusive_zone(win, -1)
+
+    css = Gtk.CssProvider()
+    css.load_from_data(b"""
+        .osk-set { border: 2px solid #3d6fd8; border-radius: 8px; }
+        .osk-title { font-weight: bold; font-size: 14pt; padding: 8px 12px; }
+        .osk-hint { color: #888888; font-size: 9pt; }
+        .osk-status { padding: 4px 12px; }
+    """)
+    Gtk.StyleContext.add_provider_for_screen(scr, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win.get_style_context().add_class("osk-set")
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    win.add(root)
+    title = Gtk.Label(label="Настройки экранной клавиатуры, значка и буфера обмена", xalign=0)
+    title.get_style_context().add_class("osk-title")
+    root.pack_start(title, False, False, 0)
+    nb = Gtk.Notebook()
+    nb.set_scrollable(True)
+    root.pack_start(nb, True, True, 0)
+
+    getters = {}      # (section, key) -> (get(), orig, kind, hash)
+    widgets = {}
+
+    def mk_color(spec_val, hashed):
+        box = Gtk.Box(spacing=6)
+        ent = Gtk.Entry()
+        ent.set_width_chars(10)
+        ent.set_placeholder_text("не задан")
+        btn = Gtk.ColorButton()
+        box.pack_start(ent, False, False, 0)
+        box.pack_start(btn, False, False, 0)
+
+        def set_btn(*_):
+            try:
+                c = parse_color(ent.get_text())
+            except ValueError:
+                return
+            if c:
+                rgba = Gdk.RGBA()
+                if rgba.parse("#" + c[:6]):
+                    btn.set_rgba(rgba)
+
+        def picked(_b):
+            c = btn.get_rgba()
+            h = "%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
+            ent.set_text(("#" if hashed else "") + h)
+
+        ent.set_text(spec_val)
+        set_btn()
+        ent.connect("changed", set_btn)
+        btn.connect("color-set", picked)
+        clr = Gtk.Button(label="✕")
+        clr.set_tooltip_text("сбросить (не задан)")
+        clr.connect("clicked", lambda *_: ent.set_text(""))
+        box.pack_start(clr, False, False, 0)
+        return box, ent
+
+    for tab, rows in T:
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6, margin=12)
+        sc.add(grid)
+        nb.append_page(sc, Gtk.Label(label=tab))
+        r = 0
+        for sec, key, label, kind, default, opt, hint in rows:
+            cur = get_cfg(data, sec).get(key, default)
+            lab = Gtk.Label(label=label, xalign=0)
+            lab.set_line_wrap(True)
+            grid.attach(lab, 0, r, 1, 1)
+            hashed = False
+            if kind == "int":
+                w = Gtk.SpinButton.new_with_range(opt[0], opt[1], 1)
+                w.set_value(int(cur))
+                get = lambda w=w: int(w.get_value())
+            elif kind == "float":
+                w = Gtk.SpinButton.new_with_range(opt[0], opt[1], opt[2])
+                w.set_digits(2)
+                w.set_value(float(cur))
+                get = lambda w=w: round(w.get_value(), 4)
+            elif kind == "bool":
+                w = Gtk.Switch()
+                w.set_active(bool(cur))
+                w.set_halign(Gtk.Align.START)
+                get = lambda w=w: w.get_active()
+            elif kind in ("str", "path"):
+                w = Gtk.Entry()
+                w.set_text(str(cur))
+                w.set_hexpand(True)
+                get = lambda w=w: w.get_text()
+            elif kind == "list":
+                w = Gtk.Entry()
+                w.set_text(", ".join(x if x else '""' for x in cur))
+                w.set_hexpand(True)
+                get = lambda w=w: strlist(w.get_text())
+            elif kind == "choice":
+                w = Gtk.ComboBoxText()
+                for o in opt:
+                    w.append_text(o)
+                if str(cur) not in opt:
+                    w.append_text(str(cur))
+                    opt = list(opt) + [str(cur)]
+                w.set_active(opt.index(str(cur)))
+                get = lambda w=w: w.get_active_text()
+            elif kind in ("color", "hcolor"):
+                hashed = kind == "hcolor" or str(cur).startswith("#")
+                w, ent = mk_color(str(cur), hashed)
+                get = lambda ent=ent, hashed=hashed: ("#" if hashed else "") + parse_color(ent.get_text()) if parse_color(ent.get_text()) else ""
+            elif kind in ("alpha", "alpha_f"):
+                w = Gtk.Box(spacing=8)
+                sc_ = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 255, 1)
+                sc_.set_hexpand(True)
+                sc_.set_value_pos(Gtk.PositionType.RIGHT)
+                sc_.set_value(255 if int(cur) < 0 else int(cur))
+                w.pack_start(sc_, True, True, 0)
+                if kind == "alpha_f":
+                    chk = Gtk.CheckButton(label="как у основной")
+                    chk.set_active(int(cur) < 0)
+                    sc_.set_sensitive(int(cur) >= 0)
+                    chk.connect("toggled", lambda c, s=sc_: s.set_sensitive(not c.get_active()))
+                    w.pack_start(chk, False, False, 0)
+                    get = lambda sc_=sc_, chk=chk: -1 if chk.get_active() else int(sc_.get_value())
+                else:
+                    get = lambda sc_=sc_: int(sc_.get_value())
+            grid.attach(w, 1, r, 1, 1)
+            if hint:
+                h = Gtk.Label(label=hint, xalign=0)
+                h.set_line_wrap(True)
+                h.get_style_context().add_class("osk-hint")
+                grid.attach(h, 1, r + 1, 1, 1)
+                r += 1
+            r += 1
+            have = key in get_cfg(data, sec)
+            getters[(sec, key)] = (get, cur, kind, have)
+            widgets[(sec, key)] = w
+
+    status = Gtk.Label(label="", xalign=0)
+    status.get_style_context().add_class("osk-status")
+    status.set_line_wrap(True)
+    root.pack_start(status, False, False, 0)
+    bar = Gtk.Box(spacing=8, margin=10)
+    bar.set_halign(Gtk.Align.END)
+    b_ok = Gtk.Button(label="OK")
+    b_apply = Gtk.Button(label="Применить")
+    b_cancel = Gtk.Button(label="Отмена")
+    for b in (b_apply, b_ok, b_cancel):
+        bar.pack_start(b, False, False, 0)
+    root.pack_start(bar, False, False, 0)
+
+    def say(txt):
+        status.set_text(txt)
+
+    def run_bg(args):
+        try:
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+
+    def apply(_b=None):
+        changes = []
+        try:
+            for (sec, key), (get, orig, kind, have) in getters.items():
+                new = get()
+                if same(new, orig):
+                    continue
+                if kind in ("color", "hcolor") and new == "":
+                    changes.append((sec, key, None))
+                else:
+                    changes.append((sec, key, new))
+        except ValueError as e:
+            say("Ошибка: " + str(e))
+            return False
+        if not changes:
+            say("Изменений нет")
+            return True
+        try:
+            secs = save_changes(CONF, changes)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            say(f"Не удалось сохранить: {e}")
+            return False
+        for sec, key, val in changes:                      # новая точка отсчёта
+            g, orig, kind, have = getters[(sec, key)]
+            getters[(sec, key)] = (g, val if val is not None else "", kind, True)
+        did = []
+        if secs & RESTART_KB:
+            st = subprocess.run([sys.executable, str(HERE / "osk"), "status"], capture_output=True, text=True).stdout.strip()
+            if st and st != "stopped":
+                run_bg([sys.executable, str(HERE / "osk"), "restart"] + (["--hidden"] if st == "hidden" else []))
+                did.append("клавиатура перезапущена")
+            else:
+                did.append("клавиатура применит при запуске")
+        if "tray" in secs:
+            run_bg([sys.executable, str(HERE / "osk-tray"), "restart"])
+            did.append("значок перезапущен")
+        if "clipboard" in secs:
+            if any(c[0] == "clipboard" and c[1] in WATCH_KEYS for c in changes):
+                run_bg(["sh", "-c", f"pkill -u {os.getuid()} -f '[c]lipd watch'; sleep 1; exec {HERE / 'clipd'} watch"])
+                did.append("clipd перезапущен")
+            else:
+                did.append("окна истории и шаблонов применят при следующем открытии")
+        say("Сохранено (копия: osk.toml.bak). " + "; ".join(did))
+        return True
+
+    def ok(_b):
+        if apply():
+            win.close()
+
+    b_apply.connect("clicked", apply)
+    b_ok.connect("clicked", ok)
+    b_cancel.connect("clicked", lambda *_: win.close())
+    win.connect("key-press-event", lambda w, e: win.close() if e.keyval == Gdk.KEY_Escape else False)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    test = os.environ.get("OSK_SETTINGS_TEST")          # отладка: "раздел.ключ=значение;..." и затем сразу «Применить»
+    if test:
+        def drive():
+            for item in test.split(";"):
+                if item == "APPLY":
+                    apply()
+                    continue
+                if item.startswith("TAB"):
+                    nb.set_current_page(int(item[3:]))
+                    continue
+                k, v = item.split("=", 1)
+                sec, key = k.rsplit(".", 1) if k.rsplit(".", 1)[0] in {s for s, _ in getters} else (k.split(".")[0], k.split(".", 1)[1])
+                w = widgets[(sec, key)]
+                if isinstance(w, Gtk.SpinButton):
+                    w.set_value(float(v))
+                elif isinstance(w, Gtk.Switch):
+                    w.set_active(v == "1")
+                elif isinstance(w, Gtk.Entry):
+                    w.set_text(v)
+                elif isinstance(w, Gtk.Box):
+                    for ch in w.get_children():
+                        if isinstance(ch, Gtk.Entry):
+                            ch.set_text(v)
+                        if isinstance(ch, Gtk.Scale):
+                            ch.set_value(float(v))
+                        if isinstance(ch, Gtk.CheckButton):
+                            ch.set_active(False)
+            return False
+        GLib.timeout_add(500, drive)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        selftest()
+    else:
+        sys.exit(run_gui())
