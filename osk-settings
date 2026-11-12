@@ -13,13 +13,18 @@
 Проверка без окна:  osk-settings --selftest
 """
 import fcntl
+import getpass
 import json
 import os
+import pty
 import re
+import select
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -148,6 +153,14 @@ add("Шаблоны",
     ("clipboard", "templates_export_strip_ext", "При экспорте убирать .txt", "bool", True, None, ""),
     ("clipboard", "templates_export_strip_newline", "При экспорте убирать перевод строки", "bool", True, None, ""),
     ("clipboard", "templates_export_prune", "Удалять в экспорте лишнее", "bool", True, None, ""),
+)
+
+PERM_TAB = "Система"
+add(PERM_TAB,
+    ("system", "settings_window", "Окно настроек", "choice", "window", ["window", "layer"],
+     "window - обычное окно (двигается и растягивается мышью, размер запоминается); layer - поверх экранной клавиатуры, без перемещения"),
+    ("system", "auto_fix_perms", "Сама исправлять права на файлах программы", "bool", True, None,
+     "если файлы стали недоступны (после Syncthing, запуска от root и т.п.); при необходимости спросит пароль sudo/su"),
 )
 
 RESTART_KB = {"keyboard", "floating", "floating.colors", "colors"}
@@ -287,15 +300,248 @@ def save_changes(path, changes):
         set_value(lines, sec, key, val)
     out = "\n".join(lines).rstrip("\n") + "\n"
     tomllib.loads(out)                                    # проверка: файл остаётся корректным TOML
-    bak = real.with_name(real.name + ".bak")
     if real.exists() and not getattr(save_changes, "_baked", False):
-        shutil.copy2(real, bak)
+        save_changes.info = make_backup(real)              # не получилось - не страшно, сохранение не блокируем
         save_changes._baked = True
     fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".osk-settings-")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(out)
+    try:
+        os.chmod(tmp, (real.stat().st_mode & 0o7777) if real.exists() else 0o644)    # права файла не меняем
+    except OSError:
+        pass
     os.replace(tmp, real)
     return {c[0] for c in changes}
+
+
+# ---------------------------------------------------------------- права доступа
+PASSFILE = HOME / ".config/osk/.sudo-pass"          # запомненный пароль (по желанию), права 600
+
+
+class NeedPassword(Exception):
+    pass
+
+
+class BadPassword(Exception):
+    pass
+
+
+def read_pass():
+    try:
+        return PASSFILE.read_text(encoding="utf-8").rstrip("\n") or None
+    except OSError:
+        return None
+
+
+def save_pass(pw):
+    PASSFILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(PASSFILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(pw + "\n")
+    os.chmod(PASSFILE, 0o600)
+
+
+def forget_pass():
+    try:
+        PASSFILE.unlink()
+    except OSError:
+        pass
+
+
+def _run(argv, inp=None, timeout=30):
+    try:
+        r = subprocess.run(argv, input=inp, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stderr or "") + (r.stdout or "")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def su_run(argv, password, timeout=20):
+    """su root -c <argv> через псевдотерминал. -> 'ok' | 'need' (нужен пароль) | 'bad' (не подошёл) | 'fail'."""
+    if not shutil.which("su"):
+        return "fail"
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp("su", ["su", "root", "-c", shlex.join(argv)])
+        finally:
+            os._exit(127)
+    out, sent, end = "", False, time.time() + timeout
+    status = None
+    try:
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.3)
+            if r:
+                try:
+                    d = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                out += d.decode("utf-8", "ignore")
+                if not sent and re.search(r"(?i)(password|парол)[^\n]*:\s*$", out):
+                    if password is None:
+                        os.kill(pid, 9)
+                        os.waitpid(pid, 0)
+                        return "need"
+                    os.write(fd, (password + "\n").encode())
+                    sent, out = True, ""
+        _, st = os.waitpid(pid, 0)
+        status = os.waitstatus_to_exitcode(st)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if status == 0:
+        return "ok"
+    if sent and re.search(r"(?i)(failure|incorrect|sorry|сбой|неверн|ошибк)", out):
+        return "bad"
+    return "bad" if sent else "fail"
+
+
+def priv_run(argv, password=None):
+    """Выполнить argv от root: sudo без пароля -> su без пароля -> (с паролем) sudo -S -> su.
+    Бросает NeedPassword (нужен пароль) / BadPassword (пароль не подошёл). -> (ok, сообщение)."""
+    if os.geteuid() == 0:
+        rc, msg = _run(argv)
+        return rc == 0, msg
+    if shutil.which("sudo"):
+        rc, msg = _run(["sudo", "-n"] + argv)
+        if rc == 0:
+            return True, ""
+    st = su_run(argv, None)
+    if st == "ok":
+        return True, ""
+    if password is None:
+        raise NeedPassword()
+    if shutil.which("sudo"):
+        rc, msg = _run(["sudo", "-S", "-p", ""] + argv, inp=password + "\n")
+        if rc == 0:
+            return True, ""
+    if su_run(argv, password) == "ok":
+        return True, ""
+    raise BadPassword()
+
+
+def perm_roots():
+    cands = [HERE, Path(os.path.realpath(CONF)).parent, HOME / ".config/osk", HOME / ".cache/osk",
+             HOME / ".local/state/osk"]
+    out = []
+    for c in cands:
+        try:
+            c = c.resolve()
+        except OSError:
+            continue
+        if c.is_dir() and c != HOME and len(c.parts) > 2 and c not in out:
+            out.append(c)
+    return out
+
+
+def find_bad(roots, limit=30000):
+    """Файлы/папки, которые пользователь не может менять (чужой владелец или нет прав)."""
+    uid, bad, n = os.getuid(), [], 0
+    for root in roots:
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in (".git", "node_modules", "__pycache__")]
+            for name in [""] + dns + fns:
+                p = os.path.join(dp, name) if name else dp
+                n += 1
+                if n > limit:
+                    return bad
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if os.path.islink(p):
+                    continue
+                isdir = os.path.isdir(p)
+                need = (os.R_OK | os.W_OK | os.X_OK) if isdir else (os.R_OK | os.W_OK)
+                if st.st_uid != uid or not os.access(p, need):
+                    bad.append(p)
+    return bad
+
+
+def fix_perms(roots, ask=None):
+    """Чинит владельца и права. ask(note) -> (пароль, запомнить) | None. -> (код, сообщение): код -1 = не удалось."""
+    uid, gid = os.getuid(), os.getgid()
+    bad = find_bad(roots)
+    if not bad:
+        return 0, "Права в порядке"
+    for p in list(bad):                                   # свои файлы без прав - чиним без администратора
+        try:
+            st = os.lstat(p)
+            if st.st_uid == uid:
+                os.chmod(p, st.st_mode | (0o700 if os.path.isdir(p) else 0o600))
+        except OSError:
+            pass
+    bad = find_bad(roots)
+    if not bad:
+        return 1, "Права исправлены"
+    pw, remember, note = read_pass(), False, False
+    saved = pw
+    for _ in range(4):
+        try:
+            for i in range(0, len(bad), 150):
+                chunk = " ".join(shlex.quote(p) for p in bad[i:i + 150])
+                cmd = f"chown -h {uid}:{gid} -- {chunk}; chmod u+rwX -- {chunk}"
+                priv_run(["sh", "-c", cmd], pw)
+            break
+        except NeedPassword:
+            pass
+        except BadPassword:
+            note = True
+            if pw and pw == saved:
+                forget_pass()
+                saved = None
+        if ask is None:
+            return -1, "Нужны права администратора: sudo/su просят пароль (запусти `osk settings` и введи его в окне)"
+        res = ask(note)
+        if res is None:
+            return -1, "Исправление прав отменено (нужен пароль sudo/su)"
+        pw, remember = res
+    else:
+        return -1, "Пароль не подошёл"
+    if remember and pw:
+        try:
+            save_pass(pw)
+        except OSError:
+            pass
+    left = find_bad(roots)
+    if left:
+        return -1, f"Не удалось исправить права у {len(left)} файлов (например {left[0]})"
+    return len(bad), f"Права исправлены у {len(bad)} файлов"
+
+
+def cli_fixperms():
+    def ask(note):
+        env = os.environ.get("OSK_SETTINGS_PASS")
+        if env is not None:
+            return (env, False) if not note else None
+        if not sys.stdin.isatty():
+            return None
+        pw = getpass.getpass("Пароль (для sudo - ваш, для su - root)" + (" [прошлый не подошёл]" if note else "") + ": ")
+        rem = input("Запомнить пароль (файл ~/.config/osk/.sudo-pass, права 600)? [y/N] ").strip().lower() in ("y", "д", "да")
+        return pw, rem
+    n, msg = fix_perms(perm_roots(), ask)
+    print(msg)
+    return 0 if n >= 0 else 1
+
+
+def make_backup(real):
+    """Копия osk.toml.bak рядом; не вышло - в ~/.cache/osk; не вышло совсем - пропускаем (сохранению не мешает)."""
+    for bak in (real.with_name(real.name + ".bak"), HOME / ".cache/osk" / (real.name + ".bak")):
+        try:
+            bak.parent.mkdir(parents=True, exist_ok=True)
+            if bak.exists() or bak.is_symlink():
+                bak.unlink()
+            shutil.copy2(real, bak)
+            return str(bak)
+        except OSError:
+            continue
+    return None
 
 
 def selftest():
@@ -334,7 +580,11 @@ def run_gui():
     except (ValueError, ImportError):
         GtkLayerShell = None
 
-    lock = open(RUN / "osk-settings.lock", "w")
+    try:
+        lock = open(RUN / "osk-settings.lock", "w")
+    except OSError:
+        (HOME / ".cache/osk").mkdir(parents=True, exist_ok=True)
+        lock = open(HOME / ".cache/osk/settings.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -352,7 +602,8 @@ def run_gui():
     win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
     win.set_title("Настройки экранной клавиатуры")
     scr = Gdk.Screen.get_default()
-    plain = os.environ.get("OSK_SETTINGS_PLAIN") or GtkLayerShell is None
+    mode = os.environ.get("OSK_SETTINGS_MODE") or get_cfg(data, "system").get("settings_window", "window")
+    plain = mode != "layer" or GtkLayerShell is None
     if not plain:
         try:
             plain = not GtkLayerShell.is_supported()
@@ -365,8 +616,31 @@ def run_gui():
         sw_, sh_ = g.width, g.height
     except Exception:
         pass
-    win.set_default_size(min(780, sw_ - 40), min(640, sh_ - 60))
-    win.set_size_request(min(780, sw_ - 40), min(640, sh_ - 60))
+    GEO = HOME / ".cache/osk/settings-win.json"          # размер и положение окна запоминаются
+    try:
+        g0 = {k: int(v) for k, v in json.loads(GEO.read_text()).items() if k in ("x", "y", "w", "h")}
+    except (OSError, ValueError, AttributeError):
+        g0 = {}
+    gw = max(520, min(g0.get("w", min(1000, int(sw_ * 0.8))), sw_))
+    gh = max(380, min(g0.get("h", min(720, int(sh_ * 0.85))), sh_))
+    geo = {"w": gw, "h": gh,
+           "x": max(0, min(g0.get("x", (sw_ - gw) // 2), sw_ - gw)),
+           "y": max(0, min(g0.get("y", (sh_ - gh) // 2), sh_ - gh))}
+
+    def geo_save():
+        try:
+            if plain:
+                geo["w"], geo["h"] = win.get_size()
+            GEO.parent.mkdir(parents=True, exist_ok=True)
+            GEO.write_text(json.dumps(geo))
+        except OSError:
+            pass
+
+    win.set_default_size(geo["w"], geo["h"])
+    if plain:
+        win.set_decorated(True)                  # обычное окно: двигается и растягивается мышью как любое другое
+    else:
+        win.set_size_request(geo["w"], geo["h"])
     if not plain:
         win.set_decorated(False)
         GtkLayerShell.init_for_window(win)
@@ -377,6 +651,10 @@ def run_gui():
         else:
             GtkLayerShell.set_keyboard_interactivity(win, True)
         GtkLayerShell.set_exclusive_zone(win, -1)
+        GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+        GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, geo["x"])
+        GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, geo["y"])
 
     css = Gtk.CssProvider()
     css.load_from_data(b"""
@@ -386,17 +664,20 @@ def run_gui():
         .osk-status { padding: 4px 12px; }
     """)
     Gtk.StyleContext.add_provider_for_screen(scr, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-    win.get_style_context().add_class("osk-set")
+    if not plain:
+        win.get_style_context().add_class("osk-set")
 
     root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     win.add(root)
     title = Gtk.Label(label="Настройки экранной клавиатуры, значка и буфера обмена", xalign=0)
     title.get_style_context().add_class("osk-title")
-    root.pack_start(title, False, False, 0)
+    if not plain:
+        root.pack_start(title, False, False, 0)
     nb = Gtk.Notebook()
-    nb.set_scrollable(True)
+    nb.set_tab_pos(Gtk.PositionType.LEFT)                   # вкладки слева: всегда помещаются
     root.pack_start(nb, True, True, 0)
 
+    perm_grid = [None, 0]
     getters = {}      # (section, key) -> (get(), orig, kind, hash)
     widgets = {}
 
@@ -511,6 +792,27 @@ def run_gui():
             have = key in get_cfg(data, sec)
             getters[(sec, key)] = (get, cur, kind, have)
             widgets[(sec, key)] = w
+        if tab == PERM_TAB:
+            perm_grid[0], perm_grid[1] = grid, r
+
+    def refresh_pass_label():
+        pass_lab.set_text("Сохранённый пароль: " + ("есть" if read_pass() else "нет"))
+
+    g_, r_ = perm_grid
+    pass_lab = Gtk.Label(label="", xalign=0)
+    g_.attach(pass_lab, 0, r_, 2, 1)
+    b_fix = Gtk.Button(label="Проверить и исправить права сейчас")
+    b_forget = Gtk.Button(label="Забыть сохранённый пароль")
+    hb = Gtk.Box(spacing=8)
+    hb.pack_start(b_fix, False, False, 0)
+    hb.pack_start(b_forget, False, False, 0)
+    g_.attach(hb, 0, r_ + 1, 2, 1)
+    info = Gtk.Label(label="Проверяются папка программы и ~/.config/osk, ~/.cache/osk, ~/.local/state/osk. "
+                           "Порядок: sudo без пароля -> su без пароля -> запрос пароля. "
+                           "Из терминала то же делает `osk fixperms`.", xalign=0)
+    info.set_line_wrap(True)
+    info.get_style_context().add_class("osk-hint")
+    g_.attach(info, 0, r_ + 2, 2, 1)
 
     status = Gtk.Label(label="", xalign=0)
     status.get_style_context().add_class("osk-status")
@@ -534,6 +836,73 @@ def run_gui():
         except OSError:
             pass
 
+    def auto_fix():
+        g = getters.get(("system", "auto_fix_perms"))
+        return bool(g[0]()) if g else True
+
+    def ask_gui(note):
+        env = os.environ.get("OSK_SETTINGS_PASS")
+        if env is not None:                                    # для проверок без окна
+            return (env, False) if not note else None
+        dlg = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        dlg.set_title("Нужен пароль")
+        if plain:
+            dlg.set_transient_for(win)
+            dlg.set_modal(True)
+            dlg.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        if not plain:
+            dlg.set_decorated(False)
+            GtkLayerShell.init_for_window(dlg)
+            GtkLayerShell.set_namespace(dlg, "osk-settings-pass")
+            GtkLayerShell.set_layer(dlg, GtkLayerShell.Layer.OVERLAY)
+            if hasattr(GtkLayerShell, "set_keyboard_mode"):
+                GtkLayerShell.set_keyboard_mode(dlg, GtkLayerShell.KeyboardMode.ON_DEMAND)
+            GtkLayerShell.set_exclusive_zone(dlg, -1)
+        if not plain:
+            dlg.get_style_context().add_class("osk-set")
+        dlg.set_size_request(min(520, sw_ - 40), -1)
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
+        dlg.add(v)
+        txt = ("Чтобы исправить права доступа на файлах программы, нужны права администратора.\n"
+               "Введи пароль: для sudo - твой, для su - пароль root.")
+        lab = Gtk.Label(label=txt, xalign=0)
+        lab.set_line_wrap(True)
+        v.pack_start(lab, False, False, 0)
+        if note:
+            err = Gtk.Label(label="Пароль не подошёл, попробуй ещё раз.", xalign=0)
+            v.pack_start(err, False, False, 0)
+        ent = Gtk.Entry()
+        ent.set_visibility(False)
+        ent.set_placeholder_text("пароль")
+        v.pack_start(ent, False, False, 0)
+        chk = Gtk.CheckButton(label="Запомнить пароль (файл ~/.config/osk/.sudo-pass, права 600)")
+        v.pack_start(chk, False, False, 0)
+        row = Gtk.Box(spacing=8)
+        row.set_halign(Gtk.Align.END)
+        bo, bc = Gtk.Button(label="OK"), Gtk.Button(label="Отмена")
+        row.pack_start(bo, False, False, 0)
+        row.pack_start(bc, False, False, 0)
+        v.pack_start(row, False, False, 0)
+        res = {"v": None}
+
+        def done(_b=None):
+            res["v"] = (ent.get_text(), chk.get_active())
+            dlg.close()
+        bo.connect("clicked", done)
+        ent.connect("activate", done)
+        bc.connect("clicked", lambda *_: dlg.close())
+        dlg.connect("key-press-event", lambda w, e: dlg.close() if e.keyval == Gdk.KEY_Escape else False)
+        dlg.connect("destroy", lambda *_: Gtk.main_quit())
+        dlg.show_all()
+        ent.grab_focus()
+        Gtk.main()
+        return res["v"]
+
+    def do_fix():
+        r = fix_perms(perm_roots(), ask_gui)
+        refresh_pass_label()
+        return r
+
     def apply(_b=None):
         changes = []
         try:
@@ -551,11 +920,23 @@ def run_gui():
         if not changes:
             say("Изменений нет")
             return True
-        try:
-            secs = save_changes(CONF, changes)
-        except (OSError, tomllib.TOMLDecodeError) as e:
-            say(f"Не удалось сохранить: {e}")
-            return False
+        secs = None
+        for attempt in (1, 2):
+            try:
+                secs = save_changes(CONF, changes)
+                break
+            except PermissionError as e:
+                if attempt == 2 or not auto_fix():
+                    say(f"Не удалось сохранить: {e}")
+                    return False
+                say("Нет доступа к файлам, исправляю права...")
+                n, msg = do_fix()
+                if n < 0:
+                    say(msg)
+                    return False
+            except (OSError, tomllib.TOMLDecodeError) as e:
+                say(f"Не удалось сохранить: {e}")
+                return False
         for sec, key, val in changes:                      # новая точка отсчёта
             g, orig, kind, have = getters[(sec, key)]
             getters[(sec, key)] = (g, val if val is not None else "", kind, True)
@@ -576,13 +957,33 @@ def run_gui():
                 did.append("clipd перезапущен")
             else:
                 did.append("окна истории и шаблонов применят при следующем открытии")
-        say("Сохранено (копия: osk.toml.bak). " + "; ".join(did))
+        bi = getattr(save_changes, "info", None)
+        say("Сохранено" + (f" (копия: {bi}). " if bi else " (копию сделать не удалось). ") + "; ".join(did))
         return True
 
     def ok(_b):
         if apply():
             win.close()
 
+    b_fix.connect("clicked", lambda *_: say(do_fix()[1]))
+    b_forget.connect("clicked", lambda *_: (forget_pass(), refresh_pass_label()))
+    refresh_pass_label()
+
+    def startup_check():
+        if auto_fix() and find_bad(perm_roots()):
+            say("Нашёл файлы с неверными правами, исправляю...")
+            say(do_fix()[1])
+        return False
+    GLib.timeout_add(300, startup_check)
+    win.connect("destroy", lambda *_: geo_save())
+    save_t = {"id": 0}
+
+    def on_conf(_w, ev):
+        if save_t["id"]:
+            GLib.source_remove(save_t["id"])
+        save_t["id"] = GLib.timeout_add(600, lambda: (geo_save(), save_t.update(id=0), False)[2])
+        return False
+    win.connect("configure-event", on_conf)
     b_apply.connect("clicked", apply)
     b_ok.connect("clicked", ok)
     b_cancel.connect("clicked", lambda *_: win.close())
@@ -595,6 +996,9 @@ def run_gui():
             for item in test.split(";"):
                 if item == "APPLY":
                     apply()
+                    continue
+                if item == "ASK":
+                    say("ask: " + str(ask_gui(False)))
                     continue
                 if item.startswith("TAB"):
                     nb.set_current_page(int(item[3:]))
@@ -624,5 +1028,7 @@ def run_gui():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
+    elif "--fixperms" in sys.argv:
+        sys.exit(cli_fixperms())
     else:
         sys.exit(run_gui())

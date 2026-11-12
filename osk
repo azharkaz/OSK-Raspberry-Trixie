@@ -20,6 +20,7 @@
   osk float reset              вернуть положение и размер плавающей по умолчанию
   osk float status             текущее состояние плавающего режима
   osk settings                 окно настроек со всеми параметрами (Применить / Отмена)
+  osk fixperms                 исправить права на файлах программы (sudo/su; при необходимости спросит пароль)
 
 Конфиг: $OSK_CONFIG или ~/.config/osk/osk.toml
 """
@@ -536,6 +537,9 @@ def main():
         cmd_float(kb, colors, a[1:])
     elif cmd == "float-event":
         cmd_float_event(a[1:])
+    elif cmd == "fixperms":
+        sp = Path(__file__).resolve().parent / "osk-settings"
+        os.execv(sys.executable, [sys.executable, str(sp), "--fixperms"])
     elif cmd == "settings":
         sp = Path(__file__).resolve().parent / "osk-settings"
         os.execv(sys.executable, [sys.executable, str(sp)] + a[1:])
