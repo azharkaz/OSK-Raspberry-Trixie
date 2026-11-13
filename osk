@@ -20,6 +20,9 @@
   osk float reset              вернуть положение и размер плавающей по умолчанию
   osk float status             текущее состояние плавающего режима
   osk settings                 окно настроек со всеми параметрами (Применить / Отмена)
+  osk autohide set idle|window on|off|toggle   автосворачивание активной клавиатуры (по таймеру / при смене окна)
+  osk sym                      символьная <-> основная клавиатура (как удержание кнопки языка)
+  osk addmenu                  дописать в osk.toml новые пункты меню значка (ничего не перезаписывает)
   osk fixperms                 исправить права на файлах программы (sudo/su; при необходимости спросит пароль)
 
 Конфиг: $OSK_CONFIG или ~/.config/osk/osk.toml
@@ -43,6 +46,14 @@ STATE = RUN / "osk.state"
 PIDFILE = RUN / "osk.pid"
 FSTATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "osk" / "float.json"   # режим, позиция, размер плавающей
 FLT = {}                                # секция [floating] из osk.toml (заполняет load)
+AH = {}                                 # секция [autohide] из osk.toml (заполняет load)
+AH_DEFAULTS = {
+    "main_idle_s": 0,                  # основная клавиатура: спрятать через N секунд без касаний (0 = не прятать)
+    "main_on_window": False,           # основная клавиатура: спрятать при смене активного окна
+    "float_idle_s": 0,                 # плавающая: свернуть в кружок через N секунд без касаний (0 = не сворачивать)
+    "float_on_window": False,          # плавающая: свернуть в кружок при смене активного окна
+    "idle_default_s": 30,              # на сколько секунд включает таймер пункт меню «Свернуть: по таймеру»
+}
 FLOAT_DEFAULTS = {
     "start": False,                    # начинать сразу в плавающем режиме (дальше запоминается выбор из меню)
     "scale": 0.5,                      # размер плавающей: доля от полной (ширина и высота пропорционально)
@@ -95,6 +106,8 @@ def load():
     kb = {**DEFAULTS, **data.get("keyboard", {})}
     FLT.clear()
     FLT.update({**FLOAT_DEFAULTS, **data.get("floating", {})})
+    AH.clear()
+    AH.update({**AH_DEFAULTS, **data.get("autohide", {})})
     TRAY.clear()
     TRAY.update(data.get("tray", {}))
     for k in ("binary", "source_dir"):
@@ -228,6 +241,10 @@ def start(kb, colors, hidden=None):
     env = wl_env()
     me = shutil.which("osk") or str(Path(__file__).resolve())
     env["OSK_FLOAT_CMD"] = f"{me} float-event"      # плавающая сообщает, куда её перетащили / свернули
+    idle = int(AH["float_idle_s"] if float_on() else AH["main_idle_s"])
+    if idle > 0:                                    # автосворачивание по таймеру: wvkbd сама зовёт `osk autohide idle`
+        env["OSK_IDLE_S"] = str(idle)
+        env["OSK_IDLE_CMD"] = f"{me} autohide idle"
     env["OSK_LAYOUT_CMD"] = f"{me} layout"      # кнопка EN/RU на экране сообщает системе, какой язык включить
     p = subprocess.Popen(cmd, env=env, stdout=log, stderr=log, start_new_session=True)
     PIDFILE.write_text(str(p.pid))
@@ -290,6 +307,76 @@ def cmd_layer(kb, code, quiet=False):
                 pass
         elif not quiet:
             print("osk: этот wvkbd собран без патча layout-sync: выполни `osk build` и `osk restart`", file=sys.stderr)
+
+
+SYMT_MARK = b"osk-symtoggle-v1"
+AH_MARK = b"osk-autohide-v1"
+
+
+def cmd_autohide(kb, colors, a):
+    """osk autohide idle|window            - сработало автосворачивание (зовут wvkbd и osk-tray)
+       osk autohide set idle|window on|off|toggle [секунды]  - включить/выключить для той клавиатуры, что сейчас активна
+       osk autohide status"""
+    what = a[0] if a else "status"
+    fl = float_on()
+    pre = "float" if fl else "main"
+    if what in ("idle", "window"):
+        if what == "window" and not AH[f"{pre}_on_window"]:
+            return
+        if fl:                                          # плавающая: в кружок; основная: спрятать
+            fs = fstate()
+            if fs.get("collapsed"):
+                return
+            for p in pids(kb):
+                try:
+                    if AH_MARK in Path(f"/proc/{p}/exe").read_bytes():
+                        os.kill(p, signal.SIGRTMIN + 10)
+                except OSError:
+                    pass
+        elif get_state(kb) == "shown":
+            signal_to(kb, signal.SIGUSR1, "hidden")
+    elif what == "set":
+        if len(a) < 3 or a[1] not in ("idle", "window"):
+            sys.exit("osk autohide set idle|window on|off|toggle [секунды]")
+        key = f"{pre}_idle_s" if a[1] == "idle" else f"{pre}_on_window"
+        cur = AH[key]
+        want = {"on": True, "off": False, "toggle": not bool(cur)}.get(a[2])
+        if want is None:
+            sys.exit("osk autohide set idle|window on|off|toggle [секунды]")
+        if a[1] == "idle":
+            secs = int(a[3]) if len(a) > 3 else int(AH["idle_default_s"])
+            val = secs if want and secs > 0 else 0
+        else:
+            val = bool(want)
+        sp = Path(__file__).resolve().parent / "osk-settings"
+        r = subprocess.run([sys.executable, str(sp), "--set", f"autohide.{key}", json.dumps(val)], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit("osk: не удалось записать osk.toml: " + (r.stdout + r.stderr).strip())
+        AH[key] = val
+        print(f"автосворачивание ({'плавающая' if fl else 'основная'}): {a[1]} -> {val}")
+        st = get_state(kb)
+        if a[1] == "idle" and st != "stopped":          # таймер читается при запуске wvkbd
+            start(kb, colors, hidden=(st == "hidden"))
+    else:
+        for k in ("main_idle_s", "main_on_window", "float_idle_s", "float_on_window"):
+            print(f"{k} = {AH[k]}")
+
+
+def cmd_sym(kb):
+    """Символьная <-> основная клавиатура (то же, что удержание кнопки языка и «abc»)."""
+    n = 0
+    for p in pids(kb):
+        try:
+            ok = SYMT_MARK in Path(f"/proc/{p}/exe").read_bytes()
+        except OSError:
+            ok = False
+        if ok:                                  # старый wvkbd от такого сигнала завершился бы
+            os.kill(p, signal.SIGRTMIN + 9)
+            n += 1
+        else:
+            print("osk: этот wvkbd собран без патча symtoggle: выполни `osk build` и `osk restart`", file=sys.stderr)
+    if not n and not pids(kb):
+        print("osk: клавиатура не запущена", file=sys.stderr)
 
 
 def tray_send(msg):
@@ -537,6 +624,13 @@ def main():
         cmd_float(kb, colors, a[1:])
     elif cmd == "float-event":
         cmd_float_event(a[1:])
+    elif cmd == "autohide":
+        cmd_autohide(kb, colors, a[1:])
+    elif cmd == "sym":
+        cmd_sym(kb)
+    elif cmd == "addmenu":
+        sp = Path(__file__).resolve().parent / "osk-settings"
+        os.execv(sys.executable, [sys.executable, str(sp), "--addmenu"])
     elif cmd == "fixperms":
         sp = Path(__file__).resolve().parent / "osk-settings"
         os.execv(sys.executable, [sys.executable, str(sp), "--fixperms"])

@@ -156,6 +156,13 @@ DEFAULTS = {
 DEFAULT_MENU = [
     {"label": "Открыть историю буфера обмена", "command": "~/.local/bin/clipd pick --paste"},
     {"label": "Показать / скрыть клавиатуру", "command": "~/.local/bin/osk toggle"},
+    {"label": "Символьная/основная", "command": "~/.local/bin/osk sym"},
+    {"label": "Свернуть:", "items": [
+        {"label": "По таймеру", "command": "~/.local/bin/osk autohide set idle toggle", "state": "ah_idle",
+         "label_on": "\u2705 По таймеру: через {n} с без касаний", "label_off": "\u2b1c По таймеру (выкл)"},
+        {"label": "При смене окна", "command": "~/.local/bin/osk autohide set window toggle", "state": "ah_win",
+         "label_on": "\u2705 При смене окна", "label_off": "\u2b1c При смене окна"},
+    ]},
     {"label": "Плавающая:", "items": [
         {"label": "Плавающая / полная клавиатура", "command": "~/.local/bin/osk float toggle", "state": "float",
          "label_on": "\u2705 Плавающая клавиатура вкл", "label_off": "\u2b1c Плавающая клавиатура выкл"},
@@ -418,6 +425,25 @@ def float_enabled(cfg):
         return bool(cfg.get("float_start", False))
 
 
+_ah_cache = {"mt": None, "d": {}}
+
+
+def ah_cfg():
+    """Секция [autohide] из osk.toml (перечитывается при изменении файла: меню и смена окна всегда видят свежие значения)."""
+    try:
+        mt = CONF.stat().st_mtime
+    except OSError:
+        return {}
+    if _ah_cache["mt"] != mt:
+        try:
+            with open(CONF, "rb") as f:
+                d = tomllib.load(f).get("autohide", {})
+        except (OSError, tomllib.TOMLDecodeError):
+            d = {}
+        _ah_cache.update(mt=mt, d=d)
+    return _ah_cache["d"]
+
+
 def menu_label(cfg, it):
     """Подпись пункта меню. Пункт с state = "panel_watch" | "float" показывает своё состояние:
     label_on / label_off (например «✅ Сторож панели вкл» / «⬜ Сторож панели выкл»)."""
@@ -426,6 +452,15 @@ def menu_label(cfg, it):
         on = panel_watch_enabled(cfg)
     elif st == "float":
         on = float_enabled(cfg)
+    elif st in ("ah_idle", "ah_win"):                   # автосворачивание: для той клавиатуры, что сейчас активна
+        ah, pre = ah_cfg(), ("float" if float_enabled(cfg) else "main")
+        n = int(ah.get(f"{pre}_idle_s", 0) or 0)
+        on = n > 0 if st == "ah_idle" else bool(ah.get(f"{pre}_on_window", False))
+        lab = it.get("label_on" if on else "label_off") or it.get("label", "?")
+        try:
+            return lab.format(n=n)
+        except (KeyError, IndexError, ValueError):
+            return lab
     else:
         return it.get("label", "?")
     return it.get("label_on" if on else "label_off") or it.get("label", "?")
@@ -743,6 +778,8 @@ class Core:
         self.pending = None
         self.switcher = LayoutSwitcher(cfg["toggle_keys"])
         self.top = Toplevels(cfg["panel_ids"])
+        self.ah_last = None
+        self.top.on_change = self.on_windows_changed
         self.read_layout()
         self.read_osk()
         self.open_socket()
@@ -754,6 +791,19 @@ class Core:
         self.panel_gave_up = 0
         self.panel_deferred = False
         GLib.timeout_add(max(2, int(cfg["panel_check_s"])) * 1000, self.tick_panel)
+
+    def on_windows_changed(self):
+        """Активным стало другое окно: если включено «сворачивать при смене окна», зовём `osk autohide window`."""
+        ah = ah_cfg()
+        if not (ah.get("main_on_window") or ah.get("float_on_window")):
+            return
+        cur = self.top.active_id()
+        if cur is None or self.top.is_panel(cur) or cur == self.ah_last:
+            return
+        first = self.ah_last is None
+        self.ah_last = cur
+        if not first:
+            self.do("~/.local/bin/osk autohide window")
 
     # ---- команды от `osk` и из терминала ----
     def open_socket(self):

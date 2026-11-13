@@ -15,6 +15,15 @@ landscape_layers = ["wideen", "wideru"]
 start_hidden = false
 non_exclusive = true     # true: клавиатура лежит поверх панели и окон, ничего не сдвигая
 
+# Автосворачивание. Для каждой клавиатуры отдельно; 0 / false = выключено. Включать можно и из меню значка: «Свернуть:».
+# Основная прячется (как `osk hide`), плавающая сворачивается в кружок.
+[autohide]
+main_idle_s = 0                                   # основная: спрятать через N секунд без касаний
+main_on_window = false                            # основная: спрятать, когда активным становится другое окно
+float_idle_s = 0                                  # плавающая: свернуть в кружок через N секунд без касаний
+float_on_window = false                           # плавающая: свернуть при смене окна
+idle_default_s = 30                               # сколько секунд ставит пункт меню «Свернуть: по таймеру»
+
 # Цвета в формате rrggbb или rrggbbaa. Что не задано - берётся из сборки.
 # Плавающая: свои alpha и [floating.colors] (те же ключи, что в [colors]); что не задано - как у основной.
 [floating]
@@ -168,6 +177,27 @@ command = "~/.local/bin/clipd tpl-export"
 [[tray.menu]]
 label = "Показать / скрыть клавиатуру"
 command = "~/.local/bin/osk toggle"
+
+[[tray.menu]]
+label = "Символьная/основная"
+command = "~/.local/bin/osk sym"
+
+[[tray.menu]]
+label = "Свернуть:"
+
+[[tray.menu.items]]
+label = "По таймеру"
+command = "~/.local/bin/osk autohide set idle toggle"
+state = "ah_idle"
+label_on = "✅ По таймеру: через {n} с без касаний"
+label_off = "⬜ По таймеру (выкл)"
+
+[[tray.menu.items]]
+label = "При смене окна"
+command = "~/.local/bin/osk autohide set window toggle"
+state = "ah_win"
+label_on = "✅ При смене окна"
+label_off = "⬜ При смене окна"
 
 [[tray.menu]]
 label = "Плавающая:"                             # раздел с выпадающими пунктами (items); щёлкнули - раскрылся

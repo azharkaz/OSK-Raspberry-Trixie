@@ -24,8 +24,8 @@
     $            (в раскладках [[sym]]) символ из chars, вводится как Unicode (тип Copy)
 
 Страницы символов и эмодзи - таблицы [[sym]] в TOML: chars (46 символов) и top ("actions" - ряд команд Ctrl+...,
-иначе F-клавиши). Из каждой получаются раскладки sN (обычная) и fsN (плавающая, с круглой кнопкой). Кнопка Shift на
-страницах листает их по кругу, «abc» возвращает к буквам.
+иначе F-клавиши). Из каждой получаются раскладки sN (обычная) и fsN (плавающая, с круглой кнопкой). Правый Shift
+листает страницы вперёд (1,2,3...), левый - назад (9,8,7...; на нём стрелка вниз), «abc» возвращает к буквам.
 """
 import re
 import shutil
@@ -111,7 +111,8 @@ def parse_token(tok, keys):
         return {"type": "Copy", "w": w, "scheme": 0, "dollar": True}
     if body.startswith(">"):
         tgt, _, hold = body[1:].partition("+")     # >ru+s1: на удержание - раскладка s1
-        return {"type": "Layout", "w": w, "target": tgt, "hold": hold, "scheme": 0}
+        down = tgt.endswith("^")                   # >s9^: стрелка вниз на кнопке (листание назад)
+        return {"type": "Layout", "w": w, "target": tgt.rstrip("^"), "hold": hold, "scheme": 0, "down": down}
     if "=" in body:
         lab, code = body.rsplit("=", 1)
         if "/" in lab:
@@ -144,7 +145,10 @@ def emit_key(k, name, spec_layouts):
         tgt = k["target"]
         if tgt not in spec_layouts:
             die(f"кнопка >{tgt}: такой раскладки нет в TOML")
-        lab = cstr(spec_layouts[tgt].get("label", tgt.upper()))
+        lab_txt = spec_layouts[tgt].get("label", tgt.upper())
+        if k.get("down"):
+            lab_txt = lab_txt.replace("\u21e7", "\u21e9")      # ⇧ -> ⇩
+        lab = cstr(lab_txt)
         hl = ""
         if k.get("hold"):                          # удержание: другая раскладка (нужен патч sym)
             if k["hold"] not in spec_layouts:
@@ -210,7 +214,7 @@ SYM_ROWS = [
     " ".join(["$"] * 13) + " Bksp:2 _:0.5 Ins Home PgUp",
     "Tab:1.5 " + " ".join(["$"] * 12) + " bslash:1.5 _:0.5 Del End PgDn",
     "Caps:1.75 " + " ".join(["$"] * 11) + " Enter:2.25 _:3.5",
-    ">{nxt}:2.25 " + " ".join(["$"] * 10) + " >{nxt}:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
+    ">{prv}^:2.25 " + " ".join(["$"] * 10) + " >{nxt}:1.25 Cp:0.75 Paste:0.75 _:1.5 Up _:1",
     "Ctrl:1.25 Win:1.25 Alt:1.25 Space:6.25 AltGr:1.25 <back:1.25 Menu:1.25 Ctrl:1.25 _:0.5 Left Down Right",
 ]
 
@@ -225,7 +229,8 @@ def expand_sym(pages):
             die(f"[[sym]] №{i}: нужно 46 символов (13+12+11+10), а их {len(chars)}")
         top = SYM_TOP_ACTIONS if pg.get("top") == "actions" else SYM_TOP_FKEYS
         nxt = f"s{i % n + 1}"
-        rows = [r.format(top=top, nxt=nxt) for r in SYM_ROWS]
+        prv = f"s{(i - 2) % n + 1}"
+        rows = [r.format(top=top, nxt=nxt, prv=prv) for r in SYM_ROWS]
         out[f"s{i}"] = {"keymap": pg.get("keymap", "latin"), "label": f"\u21e7 {i}/{n}", "primary": False,
                         "rows": rows, "chars": chars}
         frows = [r.replace(">s", ">fs") for r in rows]

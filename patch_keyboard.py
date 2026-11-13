@@ -1029,6 +1029,239 @@ def patch_float3(c, h, m):
              + M_FLOAT3 + "\n" + mm.group(2), "float3 release", hint="fl_pbtn == 0x111")
     return c, h, m, True
 
+
+# ---------------- удержание по таймеру (osk-patch: holdtimer) ----------------
+M_HOLDT = "/* osk-patch: holdtimer */"
+
+HOLDT_KB = '''
+/* osk-patch: holdtimer */ /* удержание срабатывает само через OSK_HOLD_MS, не дожидаясь отпускания (клиенты VNC на телефоне) */
+int osk_hold_ms(void) { return OSK_HOLD_MS; }
+void osk_run_cmd(const char *c) { osk_run(c); }
+void osk_hold_fire_now(struct kbd *kb)
+{
+    if (kb->hold_pending)
+        osk_fire_hold(kb, kb->press_time + OSK_HOLD_MS);
+}
+
+'''
+
+HOLDT_MAIN = '''/* osk-patch: holdtimer */
+extern void osk_hold_fire_now(struct kbd *kb);
+extern int osk_hold_ms(void);
+static struct key *osk_hold_seen;
+static long osk_hold_t0;
+
+static int
+osk_hold_poll_ms(void)
+{
+    long left;
+    if (!keyboard.hold_pending) {
+        osk_hold_seen = NULL;
+        return -1;
+    }
+    if (keyboard.hold_pending != osk_hold_seen) {
+        osk_hold_seen = keyboard.hold_pending;
+        osk_hold_t0 = osk_fl_ms();
+    }
+    left = osk_hold_ms() - (osk_fl_ms() - osk_hold_t0);
+    return left < 1 ? 1 : (int)left;
+}
+
+static void
+osk_hold_tick(void)
+{
+    if (keyboard.hold_pending && keyboard.hold_pending == osk_hold_seen &&
+        osk_fl_ms() - osk_hold_t0 >= osk_hold_ms()) {
+        osk_hold_seen = NULL;
+        osk_hold_fire_now(&keyboard);
+    }
+}
+
+static int
+osk_poll_min(int a, int b)
+{
+    if (a < 0)
+        return b;
+    if (b < 0)
+        return a;
+    return a < b ? a : b;
+}
+
+'''
+
+
+def patch_holdtimer(c, m):
+    if M_HOLDT in c:
+        return c, m, False
+    if M_FLOAT2 not in m or M_SYM not in c:
+        raise ValueError("«holdtimer»: сначала должны примениться патчи sym и float2")
+    c = sub1(c, r"(static int osk_mod_double_tap\(struct kbd \*kb, struct key \*k, uint32_t time\)\n\{)",
+             lambda mm: HOLDT_KB.lstrip("\n") + "\n" + mm.group(1), "holdtimer (keyboard.c)", hint="osk_mod_double_tap")
+    m = sub1(m, r"(static void\nosk_fl_release\(void\)\n)",
+             lambda mm: HOLDT_MAIN + mm.group(1), "holdtimer (main.c)", hint="osk_fl_release")
+    m = sub1(m, r"poll\(fds, 2, osk_fl_poll_ms\(\)\);   /\* osk-patch: float2 \*/\n        osk_fl_tick\(\);\n",
+             lambda mm: "poll(fds, 2, osk_poll_min(osk_fl_poll_ms(), osk_hold_poll_ms()));   /* osk-patch: float2 */ /* osk-patch: holdtimer */\n        osk_fl_tick();\n        osk_hold_tick();\n",
+             "holdtimer poll", hint="osk_fl_poll_ms()")
+    return c, m, True
+
+
+# ---------------- переключатель «символьная/основная» по сигналу (osk-patch: symtoggle) ----------------
+M_SYMT = "/* osk-patch: symtoggle */"
+
+SYMT_FUNC = '''/* osk-patch: symtoggle: SIGRTMIN+9 - перейти на страницы символов или вернуться на буквы (то же, что удержание кнопки языка / «abc») */
+static const char osk_symt_mark[] __attribute__((used)) = "osk-symtoggle-v1";
+
+static void
+osk_toggle_sym(void)
+{
+    struct layout *cur = keyboard.layout, *tgt = NULL;
+    struct key *k;
+    int back = 0;
+
+    if (!cur || hidden || !layer_surface)
+        return;
+    for (k = cur->keys; k->type != Last; k++) {
+        if (k->type == BackLayer) {
+            back = 1;
+            break;
+        }
+        if (k->type == Layout && k->hold_layout && !tgt)
+            tgt = k->hold_layout;
+    }
+    if (back) {
+        if (keyboard.last_abc_layout) {
+            keyboard.compose = 0;
+            kbd_switch_layout(&keyboard, keyboard.last_abc_layout, keyboard.last_abc_index);
+            keyboard.last_abc_index = 0;
+            keyboard.last_abc_layout = keyboard.landscape ? &keyboard.layouts[keyboard.landscape_layers[0]]
+                                                          : &keyboard.layouts[keyboard.layers[0]];
+        }
+    } else if (tgt) {
+        keyboard.last_abc_layout = keyboard.layout;
+        keyboard.last_abc_index = keyboard.layer_index;
+        kbd_switch_layout(&keyboard, tgt, kbd_get_layer_index(&keyboard, tgt));
+    }
+}
+
+'''
+
+
+def patch_symtoggle(m):
+    if M_SYMT in m:
+        return m, False
+    if M_SYNC not in m:
+        raise ValueError("«symtoggle»: сначала должен примениться патч layout-sync")
+    m = sub1(m, r"(sigaddset\(&osk_early, SIGRTMIN \+ osk_n\);\n)",
+             lambda mm: mm.group(1) + "        sigaddset(&osk_early, SIGRTMIN + OSK_MAX_LAYER_SIGS + 1);   " + M_SYMT + "\n",
+             "symtoggle early mask", hint="osk_early")
+    m = sub1(m, r"(    for \(int osk_n = 1; osk_n <= OSK_MAX_LAYER_SIGS; osk_n\+\+\)\n        sigaddset\(&signal_mask, SIGRTMIN \+ osk_n\);\n)",
+             lambda mm: mm.group(1) + "    sigaddset(&signal_mask, SIGRTMIN + OSK_MAX_LAYER_SIGS + 1);   " + M_SYMT + "\n",
+             "symtoggle signal mask", hint="signal_mask")
+    m = sub1(m, r"(            else if \(si\.ssi_signo == SIGPIPE\)\n)",
+             lambda mm: "            else if ((int)si.ssi_signo == SIGRTMIN + OSK_MAX_LAYER_SIGS + 1)\n                osk_toggle_sym();   " + M_SYMT + "\n" + mm.group(1),
+             "symtoggle dispatch", hint="SIGPIPE")
+    m = sub1(m, r"(void\ntoggle_visibility\(\)\n)", lambda mm: SYMT_FUNC + mm.group(1), "symtoggle func", hint="toggle_visibility")
+    return m, True
+
+
+# ---------------- автосворачивание (osk-patch: autohide) ----------------
+M_AH = "/* osk-patch: autohide */"
+
+AH_MAIN = '''/* osk-patch: autohide */
+/* простой без касаний: через OSK_IDLE_S секунд wvkbd выполняет OSK_IDLE_CMD (osk прячет клавиатуру / сворачивает плавающую в кружок) */
+extern void osk_run_cmd(const char *cmd);
+static const char osk_ah_mark[] __attribute__((used)) = "osk-autohide-v1";
+static long osk_idle_last, osk_idle_s = -1;
+static int osk_idle_fired;
+static const char *osk_idle_cmd;
+
+static void
+osk_idle_init(void)
+{
+    const char *e;
+    if (osk_idle_s >= 0)
+        return;
+    e = getenv("OSK_IDLE_S");
+    osk_idle_s = e ? atol(e) : 0;
+    osk_idle_cmd = getenv("OSK_IDLE_CMD");
+    osk_idle_last = osk_fl_ms();
+}
+
+static void
+osk_activity(void)
+{
+    osk_idle_last = osk_fl_ms();
+    osk_idle_fired = 0;
+}
+
+static int
+osk_idle_idle_state(void)       /* 1 - клавиатуры на экране нет (скрыта / свёрнута в кружок): таймер стоит */
+{
+    return hidden || (fl_on && fl_collapsed);
+}
+
+static int
+osk_idle_poll_ms(void)
+{
+    long left;
+    osk_idle_init();
+    if (osk_idle_s <= 0 || !osk_idle_cmd || osk_idle_idle_state()) {
+        osk_activity();
+        return -1;
+    }
+    if (osk_idle_fired)
+        return -1;
+    left = osk_idle_s * 1000 - (osk_fl_ms() - osk_idle_last);
+    return left < 1 ? 1 : (int)left;
+}
+
+static void
+osk_idle_tick(void)
+{
+    osk_idle_init();
+    if (osk_idle_s > 0 && osk_idle_cmd && !osk_idle_fired && !osk_idle_idle_state() &&
+        osk_fl_ms() - osk_idle_last >= osk_idle_s * 1000) {
+        osk_idle_fired = 1;
+        osk_run_cmd(osk_idle_cmd);
+    }
+}
+
+/* SIGRTMIN+10: свернуть плавающую клавиатуру в кружок (если она развёрнута) */
+static void
+osk_fl_collapse(void)
+{
+    if (fl_on && !fl_collapsed)
+        osk_fl_toggle();
+}
+
+'''
+
+
+def patch_autohide(m):
+    if M_AH in m:
+        return m, False
+    if "/* osk-patch: symtoggle */" not in m or "/* osk-patch: holdtimer */" not in m:
+        raise ValueError("«autohide»: сначала должны примениться патчи holdtimer и symtoggle")
+    m = sub1(m, r"(/\* osk-patch: holdtimer \*/\nextern void osk_hold_fire_now)",
+             lambda mm: AH_MAIN + mm.group(1), "autohide block", hint="osk_hold_fire_now")
+    m = sub1(m, r"(sigaddset\(&osk_early, SIGRTMIN \+ OSK_MAX_LAYER_SIGS \+ 1\);   /\* osk-patch: symtoggle \*/\n)",
+             lambda mm: mm.group(1) + "        sigaddset(&osk_early, SIGRTMIN + OSK_MAX_LAYER_SIGS + 2);   " + M_AH + "\n",
+             "autohide early mask", hint="symtoggle early")
+    m = sub1(m, r"(    sigaddset\(&signal_mask, SIGRTMIN \+ OSK_MAX_LAYER_SIGS \+ 1\);   /\* osk-patch: symtoggle \*/\n)",
+             lambda mm: mm.group(1) + "    sigaddset(&signal_mask, SIGRTMIN + OSK_MAX_LAYER_SIGS + 2);   " + M_AH + "\n",
+             "autohide signal mask", hint="symtoggle mask")
+    m = sub1(m, r"(            else if \(\(int\)si\.ssi_signo == SIGRTMIN \+ OSK_MAX_LAYER_SIGS \+ 1\)\n)",
+             lambda mm: "            else if ((int)si.ssi_signo == SIGRTMIN + OSK_MAX_LAYER_SIGS + 2)\n                osk_fl_collapse();   " + M_AH + "\n" + mm.group(1),
+             "autohide dispatch", hint="symtoggle dispatch")
+    m = sub1(m, r"poll\(fds, 2, osk_poll_min\(osk_fl_poll_ms\(\), osk_hold_poll_ms\(\)\)\);",
+             lambda mm: "poll(fds, 2, osk_poll_min(osk_poll_min(osk_fl_poll_ms(), osk_hold_poll_ms()), osk_idle_poll_ms()));",
+             "autohide poll", hint="osk_poll_min")
+    m = sub1(m, r"(        osk_hold_tick\(\);\n)", lambda mm: mm.group(1) + "        osk_idle_tick();\n", "autohide tick", hint="osk_hold_tick")
+    for fn in ("wl_pointer_button", "wl_pointer_motion", "wl_touch_down", "wl_touch_up", "wl_touch_motion"):
+        m = sub1(m, r"(\n" + fn + r"\([^;{]*?\)\n\{\n)",
+                 lambda mm: mm.group(1) + "    osk_activity();   " + M_AH + "\n", "autohide hook " + fn, hint=fn)
+    return m, True
+
 def main():
     if not KC.exists() or not KH.exists() or not KM.exists():
         sys.exit("patch_keyboard: нет keyboard.c/keyboard.h/main.c, запускай из каталога wvkbd")
@@ -1042,9 +1275,12 @@ def main():
         c, h, m, ch_float = patch_float(c, h, m)
         c, h, m, ch_float2 = patch_float2(c, h, m)
         c, h, m, ch_float3 = patch_float3(c, h, m)
+        c, m, ch_holdt = patch_holdtimer(c, m)
+        m, ch_symt = patch_symtoggle(m)
+        m, ch_ah = patch_autohide(m)
     except ValueError as e:
         sys.exit(f"patch_keyboard: {e}\nФайлы не изменены. Версия wvkbd отличается - пришли соответствующий кусок кода.")
-    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float or ch_float2 or ch_float3 or ch_sym):
+    if not (ch_caps or ch_lock or ch_sync or ch_tap or ch_float or ch_float2 or ch_float3 or ch_sym or ch_holdt or ch_symt or ch_ah):
         print("patch_keyboard: все правки уже применены")
         return
     for f in (KC, KH, KM):
@@ -1053,7 +1289,7 @@ def main():
     KC.write_text(c, encoding="utf-8")
     KH.write_text(h, encoding="utf-8")
     KM.write_text(m, encoding="utf-8")
-    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("sym", ch_sym), ("float", ch_float), ("float2", ch_float2), ("float3", ch_float3)) if ok]
+    done = [n for n, ok in (("caps", ch_caps), ("mod-lock+hold", ch_lock), ("layout-sync", ch_sync), ("tap-cmd", ch_tap), ("sym", ch_sym), ("float", ch_float), ("float2", ch_float2), ("float3", ch_float3), ("holdtimer", ch_holdt), ("symtoggle", ch_symt), ("autohide", ch_ah)) if ok]
     print("patch_keyboard: применено: " + ", ".join(done))
 
 

@@ -155,6 +155,14 @@ add("Шаблоны",
     ("clipboard", "templates_export_prune", "Удалять в экспорте лишнее", "bool", True, None, ""),
 )
 
+add("Автосворачивание",
+    ("autohide", "main_idle_s", "Основная: спрятать через, с", "int", 0, (0, 86400), "после стольких секунд без касаний; 0 = не прятать"),
+    ("autohide", "main_on_window", "Основная: прятать при смене окна", "bool", False, None, "когда активным становится другое окно"),
+    ("autohide", "float_idle_s", "Плавающая: свернуть в кружок через, с", "int", 0, (0, 86400), "0 = не сворачивать"),
+    ("autohide", "float_on_window", "Плавающая: сворачивать при смене окна", "bool", False, None, ""),
+    ("autohide", "idle_default_s", "Таймер из меню «Свернуть», с", "int", 30, (1, 86400), "на сколько секунд включает таймер пункт меню «Свернуть: по таймеру»"),
+)
+
 PERM_TAB = "Система"
 add(PERM_TAB,
     ("system", "settings_window", "Окно настроек", "choice", "window", ["window", "layer"],
@@ -163,7 +171,7 @@ add(PERM_TAB,
      "если файлы стали недоступны (после Syncthing, запуска от root и т.п.); при необходимости спросит пароль sudo/su"),
 )
 
-RESTART_KB = {"keyboard", "floating", "floating.colors", "colors"}
+RESTART_KB = {"keyboard", "floating", "floating.colors", "colors", "autohide"}
 WATCH_KEYS = {"device", "sync_dir", "max_entries", "max_bytes", "primary"}
 
 
@@ -542,6 +550,89 @@ def make_backup(real):
         except OSError:
             continue
     return None
+
+
+NEW_MENU = [
+    ("Символьная/основная", '''[[tray.menu]]
+label = "Символьная/основная"
+command = "~/.local/bin/osk sym"
+'''),
+    ("Свернуть:", '''[[tray.menu]]
+label = "Свернуть:"
+
+[[tray.menu.items]]
+label = "По таймеру"
+command = "~/.local/bin/osk autohide set idle toggle"
+state = "ah_idle"
+label_on = "\u2705 По таймеру: через {n} с без касаний"
+label_off = "\u2b1c По таймеру (выкл)"
+
+[[tray.menu.items]]
+label = "При смене окна"
+command = "~/.local/bin/osk autohide set window toggle"
+state = "ah_win"
+label_on = "\u2705 При смене окна"
+label_off = "\u2b1c При смене окна"
+'''),
+    ("Настройки...", '''[[tray.menu]]
+label = "Настройки..."
+command = "~/.local/bin/osk settings"
+'''),
+]
+
+
+def add_menu():
+    """Дописывает в osk.toml новые пункты меню значка (если их там ещё нет); остальной файл не трогает."""
+    real = Path(os.path.realpath(CONF))
+    text = real.read_text(encoding="utf-8")
+    have = {m.get("label") for m in tomllib.loads(text).get("tray", {}).get("menu", [])}
+    if not have:
+        print("в osk.toml нет своего меню ([[tray.menu]]): используется встроенное, оно уже содержит новые пункты")
+        return 0
+    lines = text.split("\n")
+    added = []
+    for label, block in NEW_MENU:
+        if label in have:
+            continue
+        at = None                                           # перед разделом «Плавающая:», иначе в конец файла
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith("label") and "Плавающая:" in ln:
+                at = i - 1
+                while at > 0 and not lines[at].startswith("[[tray.menu]]"):
+                    at -= 1
+                break
+        new = block.rstrip("\n").split("\n") + [""]
+        if at is None:
+            while lines and lines[-1].strip() == "":
+                lines.pop()
+            lines += [""] + new
+        else:
+            lines[at:at] = new
+        added.append(label)
+    if not added:
+        print("все пункты меню уже есть")
+        return 0
+    out = "\n".join(lines).rstrip("\n") + "\n"
+    tomllib.loads(out)
+    fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".osk-settings-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(out)
+    os.chmod(tmp, real.stat().st_mode & 0o7777)
+    os.replace(tmp, real)
+    print("добавлены пункты меню:", ", ".join(added), "- перезапусти значок: osk-tray restart")
+    return 0
+
+
+def cli_set(key, raw):
+    """osk-settings --set раздел.ключ значение(JSON): точечная запись одного значения без окна."""
+    sec, _, k = key.rpartition(".")
+    try:
+        val = json.loads(raw)
+    except ValueError:
+        val = raw
+    save_changes._baked = True                              # служебная запись, копию .bak не трогаем
+    save_changes(CONF, [(sec, k, val)])
+    return 0
 
 
 def selftest():
@@ -1028,6 +1119,11 @@ def run_gui():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         selftest()
+    elif "--set" in sys.argv:
+        i = sys.argv.index("--set")
+        sys.exit(cli_set(sys.argv[i + 1], sys.argv[i + 2]))
+    elif "--addmenu" in sys.argv:
+        sys.exit(add_menu())
     elif "--fixperms" in sys.argv:
         sys.exit(cli_fixperms())
     else:
